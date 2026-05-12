@@ -20,6 +20,27 @@ enum CaptureTarget {
     BackwardKey,
     ModifierKey,
     Character(String),
+    PreviewToggleKey,
+}
+
+/// Tabs in the config panel. Order matches the strip rendered at the
+/// top of the central panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Display,
+    Characters,
+    Input,
+}
+
+impl Tab {
+    const ALL: &'static [Tab] = &[Tab::Display, Tab::Characters, Tab::Input];
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Display => "Display",
+            Tab::Characters => "Characters",
+            Tab::Input => "Input",
+        }
+    }
 }
 
 /// Options for the per-character / main modifier dropdown.
@@ -59,11 +80,13 @@ pub struct ConfigPanel {
     /// to disk. Kept as an Option so we can skip saving when nothing
     /// has changed since the last flush.
     last_change: Option<Instant>,
-    /// Last inner-size we asked the OS viewport to be. Tracked so we
-    /// only send a resize command when the measured content height
-    /// actually changes — re-sending the same size every frame wastes
-    /// work and can cause visual jitter.
-    last_applied_height: f32,
+    /// Currently-selected tab. Not persisted to disk — each launch starts
+    /// on Display so the first thing the user sees is consistent.
+    active_tab: Tab,
+    /// Last observed inner viewport size, in physical pixels. Used to
+    /// detect user resizes so we can persist the new size to the config
+    /// without writing on every frame.
+    last_observed_size: (u32, u32),
 }
 
 impl ConfigPanel {
@@ -103,6 +126,7 @@ impl ConfigPanel {
         // idle / hover / pressed progression (cream → gold → red).
         cc.egui_ctx.set_visuals(build_visuals());
 
+        let last_observed_size = (config.config_panel_width, config.config_panel_height);
         Self {
             config,
             new_character_buffer: String::new(),
@@ -110,7 +134,8 @@ impl ConfigPanel {
             capturing: None,
             last_capturing: None,
             last_change: None,
-            last_applied_height: 0.0,
+            active_tab: Tab::Display,
+            last_observed_size,
         }
     }
 
@@ -190,6 +215,7 @@ impl eframe::App for ConfigPanel {
                             crate::config::CharacterHotkey { vk, modifier },
                         );
                     }
+                    CaptureTarget::PreviewToggleKey => self.config.preview_toggle_key = vk,
                 }
                 self.capturing = None;
                 self.touch();
@@ -320,16 +346,9 @@ impl eframe::App for ConfigPanel {
                 });
             });
 
-        // ---- Body ----
-        // Capture the central panel's content height from inside its
-        // builder so we can size the window to it — `ctx.used_size()`
-        // only reports what was *allocated* to the CentralPanel, which
-        // is bounded by header+footer, so tall content would clip and
-        // paint over the footer without this measurement.
-        const HEADER_HEIGHT: f32 = 72.0;
-        const FOOTER_HEIGHT: f32 = 40.0;
+        // ---- Body: tab strip + active tab content, wrapped in a
+        //      ScrollArea so each tab can independently overflow. ----
         const CENTRAL_V_MARGIN: f32 = 12.0;
-        let mut central_content_height = 0.0f32;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
@@ -337,27 +356,51 @@ impl eframe::App for ConfigPanel {
                     .inner_margin(egui::Margin::symmetric(16.0, CENTRAL_V_MARGIN)),
             )
             .show(ctx, |ui| {
-                self.draw_display_mode_section(ui);
-                ui.add_space(20.0);
-                self.draw_characters_section(ui);
-                ui.add_space(20.0);
-                self.draw_hotkeys_section(ui);
-                ui.add_space(20.0);
-                self.draw_previews_section(ui);
-                central_content_height = ui.min_rect().height();
+                ui.horizontal(|ui| {
+                    for tab in Tab::ALL {
+                        let label = egui::RichText::new(tab.label()).size(14.0).strong().color(
+                            if self.active_tab == *tab {
+                                NICOTINE_RED
+                            } else {
+                                NICOTINE_BLACK
+                            },
+                        );
+                        if ui
+                            .selectable_label(self.active_tab == *tab, label)
+                            .clicked()
+                        {
+                            self.active_tab = *tab;
+                        }
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.active_tab {
+                        Tab::Display => {
+                            self.draw_display_mode_section(ui);
+                            ui.add_space(20.0);
+                            self.draw_previews_section(ui);
+                        }
+                        Tab::Characters => self.draw_characters_section(ui),
+                        Tab::Input => self.draw_hotkeys_section(ui),
+                    });
             });
 
-        // ---- Auto-size the window to fit the rendered content. ----
-        let target_height =
-            (HEADER_HEIGHT + FOOTER_HEIGHT + CENTRAL_V_MARGIN * 2.0 + central_content_height)
-                .round()
-                .clamp(300.0, 1500.0);
-        if (target_height - self.last_applied_height).abs() > 1.0 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                600.0,
-                target_height,
-            )));
-            self.last_applied_height = target_height;
+        // ---- Persist user-driven window resizes. ----
+        // eframe doesn't expose a clean "size changed" callback in 0.29,
+        // so we poll the inner viewport dimensions each frame and
+        // touch() when they differ from the last observed value.
+        let inner = ctx.input(|i| i.viewport().inner_rect);
+        if let Some(rect) = inner {
+            let w = rect.width().round().max(0.0) as u32;
+            let h = rect.height().round().max(0.0) as u32;
+            if w > 0 && h > 0 && (w, h) != self.last_observed_size {
+                self.last_observed_size = (w, h);
+                self.config.config_panel_width = w;
+                self.config.config_panel_height = h;
+                self.touch();
+            }
         }
 
         // ---- Debounced auto-save ----
@@ -548,6 +591,80 @@ impl ConfigPanel {
                 }
             });
 
+            // Row 3 — per-character preview-size override. Compact:
+            // a toggle that switches between "use global size" and
+            // "custom size for this character." W/H inputs only appear
+            // when custom is on, so at a glance you can tell which
+            // characters have an override without reading values.
+            let current_override = self.config.preview_size_overrides.get(&name).copied();
+            let has_override = current_override.is_some();
+            let mut toggle_clicked = false;
+            let mut new_w = current_override
+                .map(|s| s.width)
+                .unwrap_or(self.config.preview_width);
+            let mut new_h = current_override
+                .map(|s| s.height)
+                .unwrap_or(self.config.preview_height);
+            let mut size_dirty = false;
+            ui.horizontal(|ui| {
+                ui.add_space(22.0);
+                // selectable_label makes the toggle state visible at a
+                // glance — same widget egui uses for the tab strip.
+                if ui.selectable_label(has_override, "Custom size").clicked() {
+                    toggle_clicked = true;
+                }
+                if has_override {
+                    ui.label("W");
+                    let w_resp = ui.add(
+                        egui::DragValue::new(&mut new_w)
+                            .range(120..=800)
+                            .speed(1.0)
+                            .suffix(" px"),
+                    );
+                    ui.label("H");
+                    let h_resp = ui.add(
+                        egui::DragValue::new(&mut new_h)
+                            .range(80..=600)
+                            .speed(1.0)
+                            .suffix(" px"),
+                    );
+                    if w_resp.changed() || h_resp.changed() {
+                        size_dirty = true;
+                    }
+                }
+            });
+            if toggle_clicked {
+                if has_override {
+                    self.config.preview_size_overrides.remove(&name);
+                } else {
+                    // Seed the override with the current global dims so
+                    // toggling on doesn't suddenly resize the preview to
+                    // something arbitrary — the user can then tweak from
+                    // a sensible starting point.
+                    self.config.preview_size_overrides.insert(
+                        name.clone(),
+                        crate::config::PreviewSize {
+                            width: self.config.preview_width,
+                            height: self.config.preview_height,
+                        },
+                    );
+                }
+                let mut live = self.live.lock().unwrap();
+                live.preview_size_overrides = self.config.preview_size_overrides.clone();
+                dirty = true;
+            } else if size_dirty {
+                self.config.preview_size_overrides.insert(
+                    name.clone(),
+                    crate::config::PreviewSize {
+                        width: new_w,
+                        height: new_h,
+                    },
+                );
+                let mut live = self.live.lock().unwrap();
+                live.preview_size_overrides = self.config.preview_size_overrides.clone();
+                dirty = true;
+            }
+
             ui.add_space(2.0);
         }
 
@@ -561,9 +678,19 @@ impl ConfigPanel {
             }
         }
         if let Some(idx) = remove {
-            // Drop the per-character hotkey for the removed name too.
+            // Drop the per-character hotkey AND preview-size override for
+            // the removed name so stale map entries don't leak.
             let removed_name = self.config.characters.remove(idx);
             self.config.character_hotkeys.remove(&removed_name);
+            if self
+                .config
+                .preview_size_overrides
+                .remove(&removed_name)
+                .is_some()
+            {
+                let mut live = self.live.lock().unwrap();
+                live.preview_size_overrides = self.config.preview_size_overrides.clone();
+            }
             self.touch();
         }
 
@@ -637,23 +764,100 @@ impl ConfigPanel {
         });
 
         ui.add_space(8.0);
-        let prev_mouse = self.config.enable_mouse_buttons;
-        ui.checkbox(
-            &mut self.config.enable_mouse_buttons,
-            "Cycle on mouse side buttons (XBUTTON1/XBUTTON2)",
-        );
-        if self.config.enable_mouse_buttons != prev_mouse {
+        ui.label("Cycle on mouse side buttons (XBUTTON1/XBUTTON2):");
+        let prev_mode = self.config.mouse_cycle_mode;
+        ui.horizontal(|ui| {
+            use crate::config::MouseCycleMode;
+            if ui
+                .selectable_label(
+                    self.config.mouse_cycle_mode == MouseCycleMode::Never,
+                    "Never",
+                )
+                .clicked()
+            {
+                self.config.mouse_cycle_mode = MouseCycleMode::Never;
+            }
+            if ui
+                .selectable_label(
+                    self.config.mouse_cycle_mode == MouseCycleMode::OnlyWhenEveFocused,
+                    "Only when EVE is focused",
+                )
+                .clicked()
+            {
+                self.config.mouse_cycle_mode = MouseCycleMode::OnlyWhenEveFocused;
+            }
+            if ui
+                .selectable_label(
+                    self.config.mouse_cycle_mode == MouseCycleMode::Always,
+                    "Always",
+                )
+                .clicked()
+            {
+                self.config.mouse_cycle_mode = MouseCycleMode::Always;
+            }
+        });
+        if self.config.mouse_cycle_mode != prev_mode {
             self.touch();
         }
         ui.label(
             egui::RichText::new(
-                "Off by default. Turn on only if you don't already remap your mouse \
-                 side buttons via driver software (Logi Options+, Razer Synapse, etc.) \
-                 — otherwise this will hijack the buttons in browsers/games too.",
+                "\"Only when EVE is focused\" is recommended: keeps browser back/forward and \
+                 other apps' XBUTTON bindings working — Nicotine only intercepts side buttons \
+                 while an EVE client owns the foreground.",
             )
             .size(10.0)
             .color(NICOTINE_BLACK),
         );
+
+        ui.add_space(8.0);
+        let prev_wheel = self.config.enable_wheel_cycle;
+        ui.checkbox(
+            &mut self.config.enable_wheel_cycle,
+            "Cycle on modifier + mouse wheel",
+        );
+        if self.config.enable_wheel_cycle != prev_wheel {
+            self.touch();
+        }
+        ui.add_enabled_ui(self.config.enable_wheel_cycle, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Modifier:");
+                let current_mod = Some(self.config.wheel_cycle_modifier);
+                let selected_label = MODIFIER_CHOICES
+                    .iter()
+                    .find(|(m, _)| *m == current_mod)
+                    .map(|(_, l)| *l)
+                    .unwrap_or("Shift");
+                let mut new_mod = current_mod;
+                egui::ComboBox::from_id_salt("wheel_modifier")
+                    .selected_text(selected_label)
+                    .width(70.0)
+                    .show_ui(ui, |ui| {
+                        // Skip the "None" entry — wheel cycling without a
+                        // modifier would hijack every scroll, surprising
+                        // users in every app.
+                        for (code, label) in MODIFIER_CHOICES.iter().filter(|(c, _)| c.is_some()) {
+                            if ui.selectable_label(new_mod == *code, *label).clicked() {
+                                new_mod = *code;
+                            }
+                        }
+                    });
+                if let Some(vk) = new_mod {
+                    if vk != self.config.wheel_cycle_modifier {
+                        self.config.wheel_cycle_modifier = vk;
+                        self.touch();
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Wheel up = forward, wheel down = backward. Throttled to ~12/sec. Respects \
+                     the mouse cycle mode above — wheel cycling honors \"Only when EVE is focused\" \
+                     too.",
+                )
+                .size(10.0)
+                .color(NICOTINE_BLACK),
+            );
+        });
     }
 
     /// Button that toggles capture for a given config field. When
@@ -732,6 +936,118 @@ impl ConfigPanel {
                 live.preview_width = self.config.preview_width;
                 live.preview_height = self.config.preview_height;
             }
+
+            // Opacity sliders. Stored as u8 (0..=255) but rendered as
+            // percent for readability. ~12 step at 0..=255 maps to 5%
+            // increments which is finer than the eye can discern.
+            let prev_op = self.config.preview_opacity;
+            let prev_hop = self.config.preview_hover_opacity;
+            ui.horizontal(|ui| {
+                ui.label("Opacity:");
+                ui.add(
+                    egui::Slider::new(&mut self.config.preview_opacity, 30..=255)
+                        .show_value(false)
+                        .step_by(1.0),
+                );
+                ui.label(format!(
+                    "{}%",
+                    (self.config.preview_opacity as u32 * 100 + 127) / 255
+                ));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Hover opacity:");
+                ui.add(
+                    egui::Slider::new(&mut self.config.preview_hover_opacity, 30..=255)
+                        .show_value(false)
+                        .step_by(1.0),
+                );
+                ui.label(format!(
+                    "{}%",
+                    (self.config.preview_hover_opacity as u32 * 100 + 127) / 255
+                ));
+            });
+            if self.config.preview_opacity != prev_op
+                || self.config.preview_hover_opacity != prev_hop
+            {
+                self.touch();
+                let mut live = self.live.lock().unwrap();
+                live.preview_opacity = self.config.preview_opacity;
+                live.preview_hover_opacity = self.config.preview_hover_opacity;
+            }
+
+            ui.add_space(4.0);
+            let prev_interactive = self.config.previews_interactive;
+            // Inverted for the checkbox label — "visual only" reads more
+            // naturally than "not interactive".
+            let mut visual_only = !self.config.previews_interactive;
+            ui.checkbox(
+                &mut visual_only,
+                "Visual only (click-through; cycle with hotkeys only)",
+            );
+            self.config.previews_interactive = !visual_only;
+            if self.config.previews_interactive != prev_interactive {
+                self.touch();
+                let mut live = self.live.lock().unwrap();
+                live.previews_interactive = self.config.previews_interactive;
+            }
+
+            ui.add_space(8.0);
+            let prev_smart = self.config.smart_hide_enabled;
+            ui.checkbox(
+                &mut self.config.smart_hide_enabled,
+                "Smart Hide (auto-show only when an EVE client is ≥90% visible)",
+            );
+            if self.config.smart_hide_enabled != prev_smart {
+                self.touch();
+                let mut live = self.live.lock().unwrap();
+                live.smart_hide_enabled = self.config.smart_hide_enabled;
+            }
+
+            ui.horizontal(|ui| {
+                ui.label("Show/Hide hotkey:");
+
+                // Modifier dropdown — shared with the per-character row's
+                // pattern so users get consistent UX.
+                let current_mod = self.config.preview_toggle_modifier;
+                let selected_label = MODIFIER_CHOICES
+                    .iter()
+                    .find(|(m, _)| *m == current_mod)
+                    .map(|(_, l)| *l)
+                    .unwrap_or("None");
+                let mut new_mod = current_mod;
+                egui::ComboBox::from_id_salt("preview_toggle_mod")
+                    .selected_text(selected_label)
+                    .width(70.0)
+                    .show_ui(ui, |ui| {
+                        for (code, label) in MODIFIER_CHOICES {
+                            if ui.selectable_label(new_mod == *code, *label).clicked() {
+                                new_mod = *code;
+                            }
+                        }
+                    });
+                if new_mod != current_mod {
+                    self.config.preview_toggle_modifier = new_mod;
+                    self.touch();
+                }
+
+                let label = if self.config.preview_toggle_key == 0 {
+                    "none".to_string()
+                } else {
+                    vk_to_label(self.config.preview_toggle_key)
+                };
+                self.draw_bind_button(ui, &CaptureTarget::PreviewToggleKey, label);
+                if self.config.preview_toggle_key != 0 && ui.button("Clear").clicked() {
+                    self.config.preview_toggle_key = 0;
+                    self.touch();
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Sticky toggle: previews stay hidden until you press the key again.",
+                )
+                .size(10.0)
+                .color(NICOTINE_BLACK),
+            );
         });
     }
 }
@@ -948,7 +1264,10 @@ fn vk_to_label(vk: u16) -> String {
         0x11 | 0xA2 | 0xA3 => "Ctrl".into(),
         0x12 | 0xA4 | 0xA5 => "Alt".into(),
         0xC0 => "`".into(),
-        0x30..=0x39 => format!("{}", (vk - 0x30) as u8 as char),
+        // 0x30..=0x39 are already ASCII '0'..'9' — don't subtract 0x30
+        // (that yielded chr 0..9, which are control characters that
+        // render as empty / replacement glyphs depending on the font).
+        0x30..=0x39 => format!("{}", vk as u8 as char),
         0x41..=0x5A => format!("{}", vk as u8 as char),
         0x26 => "Up".into(),
         0x28 => "Down".into(),
@@ -969,18 +1288,17 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> Result<(), eframe:
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
         .expect("failed to decode embedded icon.png");
 
+    // Restore the user's last-known panel size. The tabbed layout
+    // (Feature 6) lets the user resize the window freely; per-frame
+    // auto-resize is gone. Clamp to a sensible minimum so a bad
+    // persisted value can't open the window too small to be usable.
+    let saved_w = (config.config_panel_width as f32).max(420.0);
+    let saved_h = (config.config_panel_height as f32).max(360.0);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            // Open at the empty-config size; the per-frame auto-resize
-            // grows the window as the user adds characters. Starting at
-            // a tall fixed value (e.g. 1000pt) caused huge dead space on
-            // first launch on machines where the OS ignores
-            // ViewportCommand::InnerSize *shrinks* on a non-resizable
-            // window — the window would never shrink back from the
-            // initial size to fit the (much shorter) empty content.
-            // Growing reliably works everywhere, so we start small.
-            .with_inner_size([600.0, 640.0])
-            .with_resizable(false)
+            .with_inner_size([saved_w, saved_h])
+            .with_min_inner_size([420.0, 360.0])
+            .with_resizable(true)
             .with_title("Nicotine")
             .with_icon(icon),
         ..Default::default()

@@ -114,8 +114,11 @@ impl MouseListener {
         wm: Arc<dyn WindowManager>,
         state: Arc<Mutex<CycleState>>,
     ) -> Result<std::thread::JoinHandle<()>> {
-        if !self.config.enable_mouse_buttons {
-            anyhow::bail!("Mouse buttons are disabled in config");
+        // `Never` mode bails; `Always` and `OnlyWhenEveFocused` both
+        // run on Linux (the focus check isn't yet portable across
+        // Wayland compositors).
+        if self.config.mouse_cycle_mode == crate::config::MouseCycleMode::Never {
+            anyhow::bail!("Mouse cycle mode is set to Never");
         }
 
         let forward_button = self.config.forward_button;

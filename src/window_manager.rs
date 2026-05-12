@@ -41,6 +41,14 @@ pub trait WindowManager: Send + Sync {
 
     /// Restore a minimized window
     fn restore_window(&self, window_id: u32) -> Result<()>;
+
+    /// Visibility ratio (0.0..=1.0) of every EVE client window. Used by
+    /// Smart Hide to decide whether previews should auto-show. The
+    /// default impl returns an empty vector so non-Windows backends
+    /// (which don't render previews) trivially disable Smart Hide.
+    fn eve_visibility_ratios(&self) -> Vec<(u32, f32)> {
+        Vec::new()
+    }
 }
 
 #[cfg(unix)]

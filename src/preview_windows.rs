@@ -27,17 +27,26 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, RegisterClassExW,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, TranslateMessage, EVENT_SYSTEM_FOREGROUND,
-    GWLP_USERDATA, HCURSOR, HICON, HMENU, HWND_TOPMOST, IDC_ARROW, MSG, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, WINEVENT_OUTOFCONTEXT, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE,
+    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, IsHungAppWindow, KillTimer, LoadCursorW,
+    RegisterClassExW, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateMessage, EVENT_SYSTEM_FOREGROUND, GWLP_USERDATA, GWL_EXSTYLE, HCURSOR,
+    HICON, HMENU, HWND_TOPMOST, IDC_ARROW, LWA_ALPHA, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WINEVENT_OUTOFCONTEXT, WM_DESTROY, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
+
+/// `WM_MOUSELEAVE` isn't exported from `Win32::UI::WindowsAndMessaging`
+/// in windows-rs 0.59 (it lives in `Win32::UI::Controls`, which we don't
+/// pull in for the rest of the crate). Defining the literal locally is
+/// cheaper than adding a whole feature flag for one message id.
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// Type alias for DWM thumbnail handles. windows-rs 0.59 doesn't expose a
 /// named Hthumbnail type — DwmRegisterThumbnail returns isize directly and
@@ -60,6 +69,38 @@ fn unpack_xy(lparam: LPARAM) -> (i32, i32) {
 /// manager thread starts and cleared on shutdown. SAFETY: only written by
 /// the manager thread; the WinEvent callback runs on the same thread.
 static MANAGER_PTR: AtomicUsize = AtomicUsize::new(0);
+
+/// Raw HWND of the manager's hidden control window. Set during `spawn`
+/// and consulted by `notify_active_change` so other threads (the input
+/// listener) can post messages to the manager's thread. Stored as
+/// AtomicIsize because HWND is `*mut c_void` and isn't Send.
+static CONTROL_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Custom message sent from `notify_active_change` to nudge the
+/// manager to flip the active-client highlight immediately, before
+/// EVENT_SYSTEM_FOREGROUND has a chance to bubble through. wparam
+/// carries the new active window ID.
+const WM_USER_FORCE_ACTIVE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 100;
+
+/// Called by the input listener right after a successful cycle so the
+/// red active-client border updates the same tick instead of waiting
+/// on EVENT_SYSTEM_FOREGROUND. Best-effort: returns immediately if the
+/// manager hasn't been spawned yet (e.g., user has previews disabled).
+pub fn notify_active_change(id: u32) {
+    let raw = CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire);
+    if raw == 0 {
+        return;
+    }
+    let hwnd = HWND(raw as *mut std::ffi::c_void);
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(hwnd),
+            WM_USER_FORCE_ACTIVE,
+            WPARAM(id as usize),
+            LPARAM(0),
+        );
+    }
+}
 
 /// Read the shared `positions_locked` flag. Used by preview + list
 /// window drag handlers to ignore mouse drags when the user has locked
@@ -289,7 +330,18 @@ struct PreviewWindowState {
     /// window. Read from WM_PAINT to choose border color. Updated by
     /// reconcile via the GWLP_USERDATA pointer.
     is_active: bool,
+    /// True between WM_MOUSEMOVE and WM_MOUSELEAVE for this preview.
+    /// Drives the opacity transition (base ↔ hover). Tracked per-window
+    /// because the user can hover one preview while others stay base.
+    hover: bool,
 }
+
+/// Live opacity values mirrored from `LiveSettings`. Read by `preview_wnd_proc`
+/// when applying hover transitions — the proc can't capture state, so a
+/// global is the cleanest way to stay in sync without locking on every
+/// mouse move. Manager writes these once per reconcile.
+static BASE_OPACITY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(230);
+static HOVER_OPACITY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
 
 /// One owned preview window. Drop unregisters the DWM thumbnail.
 struct OwnedPreview {
@@ -345,6 +397,32 @@ struct PreviewManager {
     /// InvalidateRect every 100ms otherwise produces a visible flicker
     /// and feels sluggish.
     list_last_names: Vec<String>,
+    /// Sticky user override on preview visibility, set by the show/hide
+    /// hotkey. `Some(true)` = force-shown, `Some(false)` = force-hidden,
+    /// `None` = automatic (Smart Hide controls, or always-shown when
+    /// Smart Hide is off). Outlives reconciles; cleared only by the
+    /// "Reset to auto" control in the config panel (or a Smart Hide
+    /// toggle, once that lands).
+    manual_override: Option<bool>,
+    /// Snapshot of `PREVIEW_TOGGLE_COUNTER` from the last reconcile.
+    /// When the listener thread bumps the counter, we know to flip
+    /// `manual_override` on the next tick.
+    last_toggle_counter: u32,
+    /// Most recent effective visibility decision. Cached so transitions
+    /// can be detected without re-deriving from scratch.
+    #[allow(dead_code)]
+    last_visibility_applied: bool,
+    /// Result of the most recent Smart Hide evaluation: `true` when at
+    /// least one EVE client is >=90% visible (or Smart Hide is disabled,
+    /// which collapses to "always show"). Consulted by
+    /// `previews_should_be_visible` only when `manual_override` is None.
+    last_smart_hide_show: bool,
+    /// Cached interactive state so `apply_live_interactivity` is a
+    /// no-op when nothing changed. Initial value mirrors the Config
+    /// default (true) so newly-created previews don't need a special
+    /// case — they come up interactive and the first reconcile flips
+    /// them if needed.
+    last_interactive_applied: bool,
 }
 
 /// Drop-guard for the list window — destroys the Win32 window and the
@@ -400,11 +478,88 @@ impl PreviewManager {
         self.update_active(active_id);
     }
 
+    /// Whether previews should currently be visible on screen, accounting
+    /// for sticky manual override AND Smart Hide. Manual override
+    /// (set by the show/hide hotkey) wins whenever it's `Some(_)`;
+    /// otherwise we fall back to the most recent Smart Hide evaluation
+    /// (which is `true` when Smart Hide is disabled, so the legacy
+    /// always-shown UX is preserved).
+    fn previews_should_be_visible(&self) -> bool {
+        match self.manual_override {
+            Some(v) => v,
+            None => self.last_smart_hide_show,
+        }
+    }
+
+    /// Recompute the Smart Hide decision and cache it. Called once per
+    /// reconcile tick. When disabled, force-true so manual_override is
+    /// the sole signal.
+    fn refresh_smart_hide(&mut self) {
+        let enabled = self.live.lock().unwrap().smart_hide_enabled;
+        if !enabled {
+            self.last_smart_hide_show = true;
+            return;
+        }
+        let ratios = self.wm.eve_visibility_ratios();
+        // SHOW when ANY client is >=90% visible. HIDE when none are
+        // (all minimized, occluded, or no clients at all).
+        self.last_smart_hide_show = ratios.iter().any(|(_, r)| *r >= 0.90);
+    }
+
+    /// Poll the hotkey-toggle counter and flip `manual_override` once
+    /// per fresh press. Called from the reconcile tick so the listener
+    /// thread doesn't need to touch the manager's state directly.
+    fn poll_visibility_signals(&mut self) {
+        let current =
+            crate::windows_input::PREVIEW_TOGGLE_COUNTER.load(std::sync::atomic::Ordering::Acquire);
+        if current != self.last_toggle_counter {
+            self.last_toggle_counter = current;
+            // First press from the auto state hides; subsequent presses
+            // alternate. We pick "hide first" because Smart Hide (when
+            // added) defaults to showing previews — the user who reaches
+            // for the toggle is typically trying to dismiss them.
+            let next = match self.manual_override {
+                None => Some(false),
+                Some(v) => Some(!v),
+            };
+            self.manual_override = next;
+        }
+    }
+
+    /// Apply the current effective visibility to every preview host
+    /// window. Calls ShowWindow even when the global decision hasn't
+    /// changed since the last tick — this is the cheapest path to also
+    /// catch freshly-created previews that came up `WS_VISIBLE` while
+    /// the global state is "hidden." `ShowWindow` on a window already in
+    /// the requested state is a documented no-op.
+    fn apply_visibility(&mut self) {
+        let want = self.previews_should_be_visible();
+        self.last_visibility_applied = want;
+        let cmd = if want { SW_SHOWNOACTIVATE } else { SW_HIDE };
+        for preview in self.previews.values() {
+            unsafe {
+                let _ = ShowWindow(preview.hwnd, cmd);
+            }
+        }
+        if let Some(list) = &self.list {
+            unsafe {
+                let _ = ShowWindow(list.hwnd, cmd);
+            }
+        }
+    }
+
     fn reconcile_previews(&mut self) {
+        // Service any pending visibility hotkey presses BEFORE structural
+        // reconciliation so newly-created previews this tick are spawned
+        // in the correct shown/hidden state.
+        self.poll_visibility_signals();
+
         // Apply any pending live-settings changes first — this lets the
         // user drag the size sliders in the config panel and see preview
         // windows resize in real time.
         self.apply_live_size();
+        self.apply_live_opacity();
+        self.apply_live_interactivity();
 
         let windows = {
             let s = self.state.lock().unwrap();
@@ -442,9 +597,17 @@ impl PreviewManager {
                 );
             }
         }
+
+        // Final pass — honor sticky hotkey override + Smart Hide.
+        // Done after creation so newly-spawned previews can be hidden
+        // immediately rather than flashing on screen for a frame.
+        self.refresh_smart_hide();
+        self.apply_visibility();
     }
 
     fn reconcile_list(&mut self) {
+        self.poll_visibility_signals();
+
         // Spawn the list window on first entry into this mode, or if it
         // was torn down somehow.
         if self.list.is_none() {
@@ -513,6 +676,8 @@ impl PreviewManager {
         }
 
         self.list_last_names = ordered_names;
+        self.refresh_smart_hide();
+        self.apply_visibility();
     }
 
     fn create_list_window(&mut self) -> Result<()> {
@@ -575,24 +740,133 @@ impl PreviewManager {
         Ok(())
     }
 
-    /// Read the shared LiveSettings and, if the user has adjusted preview
-    /// size, resize every preview window and update its DWM thumbnail
-    /// rect. No-op when nothing has changed.
-    fn apply_live_size(&mut self) {
-        let (want_w, want_h) = {
+    /// Toggle the click-through extended style on every preview to
+    /// match `LiveSettings::previews_interactive`. Only walks windows
+    /// when the value actually changed since last reconcile —
+    /// SetWindowLongPtrW + SWP_FRAMECHANGED triggers DWM compositing
+    /// work, so we don't want to spam it.
+    fn apply_live_interactivity(&mut self) {
+        let want_interactive = self.live.lock().unwrap().previews_interactive;
+        if want_interactive == self.last_interactive_applied {
+            return;
+        }
+        self.last_interactive_applied = want_interactive;
+        for preview in self.previews.values() {
+            unsafe {
+                let style = GetWindowLongPtrW(preview.hwnd, GWL_EXSTYLE);
+                let transparent_bit = WS_EX_TRANSPARENT.0 as isize;
+                let new_style = if want_interactive {
+                    style & !transparent_bit
+                } else {
+                    style | transparent_bit
+                };
+                if new_style != style {
+                    SetWindowLongPtrW(preview.hwnd, GWL_EXSTYLE, new_style);
+                    // SWP_FRAMECHANGED tells the system to recompute the
+                    // window's non-client area, which is how the style
+                    // change actually takes effect for input routing.
+                    let _ = SetWindowPos(
+                        preview.hwnd,
+                        None,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Read the latest opacity values from LiveSettings, mirror them
+    /// into the globals the wnd_proc reads, and re-apply the base
+    /// opacity to every non-hovered preview. The hovered preview, if
+    /// any, keeps its hover opacity until WM_MOUSELEAVE fires — at
+    /// which point it'll pick up the new base value naturally.
+    fn apply_live_opacity(&mut self) {
+        let (base, hover) = {
             let live = self.live.lock().unwrap();
-            (live.preview_width, live.preview_height)
+            (live.preview_opacity, live.preview_hover_opacity)
         };
-        if want_w == self.config.preview_width && want_h == self.config.preview_height {
+        let prev_base = BASE_OPACITY.swap(base, std::sync::atomic::Ordering::AcqRel);
+        let prev_hover = HOVER_OPACITY.swap(hover, std::sync::atomic::Ordering::AcqRel);
+        if prev_base == base && prev_hover == hover {
+            return;
+        }
+        for preview in self.previews.values() {
+            unsafe {
+                let ptr =
+                    GetWindowLongPtrW(preview.hwnd, GWLP_USERDATA) as *const PreviewWindowState;
+                let target = if !ptr.is_null() && (*ptr).hover {
+                    hover
+                } else {
+                    base
+                };
+                let _ = SetLayeredWindowAttributes(preview.hwnd, COLORREF(0), target, LWA_ALPHA);
+            }
+        }
+    }
+
+    /// True when the source EVE client is not pumping messages. We use
+    /// `IsHungAppWindow` (fast, no message-send) rather than a
+    /// `SendMessageTimeoutW` probe — the former is good enough to catch
+    /// the cases we care about (EVE stuck mid-frame or during character
+    /// select) without paying the SMTO_ABORTIFHUNG round-trip cost on
+    /// every reconcile. Returns false when the HWND is invalid (so
+    /// callers don't gate themselves into stuck-state forever if EVE
+    /// closed mid-tick).
+    fn source_is_hung(source_id: u32) -> bool {
+        let hwnd = id_to_hwnd(source_id);
+        if hwnd.0.is_null() {
+            return false;
+        }
+        unsafe { IsHungAppWindow(hwnd).as_bool() }
+    }
+
+    /// Read the shared LiveSettings and, if the user has adjusted preview
+    /// size (globals or any per-character override), resize affected
+    /// preview windows and update their DWM thumbnail rect.
+    ///
+    /// Strategy: snapshot the desired (w, h) for every preview by name,
+    /// then compare against the cached `config` values + override map.
+    /// Two paths can fire a resize: a global slider change (touches every
+    /// preview without a custom override) or an override map change
+    /// (touches just the named character).
+    fn apply_live_size(&mut self) {
+        let (want_w, want_h, want_overrides) = {
+            let live = self.live.lock().unwrap();
+            (
+                live.preview_width,
+                live.preview_height,
+                live.preview_size_overrides.clone(),
+            )
+        };
+        let globals_changed =
+            want_w != self.config.preview_width || want_h != self.config.preview_height;
+        let overrides_changed = want_overrides != self.config.preview_size_overrides;
+        if !globals_changed && !overrides_changed {
             return;
         }
         self.config.preview_width = want_w;
         self.config.preview_height = want_h;
-        let w = want_w as i32;
-        let h = want_h as i32;
-        for preview in self.previews.values() {
+        self.config.preview_size_overrides = want_overrides;
+
+        for (name, preview) in &self.previews {
+            let (w, h) = self.config.preview_size_for(name);
+            let w = w as i32;
+            let h = h as i32;
+            // Skip DWM thumbnail updates and chrome repaints when the
+            // source EVE client isn't responding. DwmUpdateThumbnailProperties
+            // on a hung source can produce a black-frame flash on every
+            // call; doing nothing lets DWM keep displaying the last good
+            // frame from when the source was healthy.
+            let hung = Self::source_is_hung(preview.source_id);
             unsafe {
-                // Resize the window without touching its position or z-order.
+                // SetWindowPos targets OUR window, never the source — safe
+                // to run even when the source is hung. Keeps the host in
+                // sync with the configured size so the rest of the chrome
+                // doesn't fall behind.
                 let _ = SetWindowPos(
                     preview.hwnd,
                     Some(HWND_TOPMOST),
@@ -602,14 +876,14 @@ impl PreviewManager {
                     h,
                     SWP_NOMOVE | SWP_NOACTIVATE,
                 );
-                // Recompute the thumbnail destination rect against the
-                // new window size so the mirror fills the new area.
+                if hung {
+                    continue;
+                }
                 let ptr =
                     GetWindowLongPtrW(preview.hwnd, GWLP_USERDATA) as *const PreviewWindowState;
                 if !ptr.is_null() {
                     update_thumbnail_rect((*ptr).thumbnail, w, h);
                 }
-                // Repaint title strip + border at the new dimensions.
                 let _ = InvalidateRect(Some(preview.hwnd), None, true);
             }
         }
@@ -688,8 +962,12 @@ impl PreviewManager {
                 (px(10 + off), px(10 + off))
             });
 
-        let width = self.config.preview_width as i32;
-        let height = self.config.preview_height as i32;
+        // Honor per-character size overrides at creation so a newly-
+        // logged-in client with a saved override doesn't briefly flash
+        // at the global size before apply_live_size catches up.
+        let (resolved_w, resolved_h) = self.config.preview_size_for(&window.title);
+        let width = resolved_w as i32;
+        let height = resolved_h as i32;
 
         let class_name: Vec<u16> = PREVIEW_CLASS.encode_utf16().collect();
         let title_w: Vec<u16> = window
@@ -700,9 +978,14 @@ impl PreviewManager {
 
         let module = unsafe { GetModuleHandleW(None) }.context("GetModuleHandleW failed")?;
 
+        // WS_EX_LAYERED is required for SetLayeredWindowAttributes (Feature 7).
+        // It composes with the existing topmost / toolwindow / noactivate
+        // flags without behavioral changes — layered just means DWM
+        // composites our window via an off-screen buffer so per-window
+        // alpha can be applied.
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
                 PCWSTR(class_name.as_ptr()),
                 PCWSTR(title_w.as_ptr()),
                 WS_POPUP | WS_VISIBLE,
@@ -737,9 +1020,18 @@ impl PreviewManager {
             drag_origin_screen: (0, 0),
             drag_origin_window: (0, 0),
             is_active: false,
+            hover: false,
         });
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(per_window) as isize);
+            // Apply the base opacity immediately so the preview comes up
+            // at the configured translucency rather than fully opaque.
+            let _ = SetLayeredWindowAttributes(
+                hwnd,
+                COLORREF(0),
+                BASE_OPACITY.load(std::sync::atomic::Ordering::Acquire),
+                LWA_ALPHA,
+            );
         }
 
         // Belt-and-suspenders topmost — WS_EX_TOPMOST should already do it,
@@ -842,6 +1134,26 @@ unsafe extern "system" fn preview_wnd_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
+            // Hover-start detection. The first WM_MOUSEMOVE after the
+            // cursor enters the window flips to hover opacity; we
+            // register a one-shot WM_MOUSELEAVE so the next time the
+            // cursor exits we get told and can revert.
+            if !state.hover {
+                state.hover = true;
+                let _ = SetLayeredWindowAttributes(
+                    hwnd,
+                    COLORREF(0),
+                    HOVER_OPACITY.load(std::sync::atomic::Ordering::Acquire),
+                    LWA_ALPHA,
+                );
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut tme);
+            }
             // Positions locked: don't track motion. Keeping drag_active
             // true means the subsequent WM_LBUTTONUP's `!dragged` path
             // still fires, so click-to-activate keeps working.
@@ -908,6 +1220,16 @@ unsafe extern "system" fn preview_wnd_proc(
                 }
                 state.dragged = false;
             }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            state.hover = false;
+            let _ = SetLayeredWindowAttributes(
+                hwnd,
+                COLORREF(0),
+                BASE_OPACITY.load(std::sync::atomic::Ordering::Acquire),
+                LWA_ALPHA,
+            );
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -1264,6 +1586,17 @@ unsafe extern "system" fn control_wnd_proc(
         }
         return LRESULT(0);
     }
+    if msg == WM_USER_FORCE_ACTIVE {
+        // Direct active-id push from the input listener. We update the
+        // highlight immediately so the user sees the red border move
+        // on the same frame as the hotkey press, without waiting for
+        // EVENT_SYSTEM_FOREGROUND to bubble through.
+        let mgr_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PreviewManager;
+        if !mgr_ptr.is_null() {
+            (*mgr_ptr).update_active(wparam.0 as u32);
+        }
+        return LRESULT(0);
+    }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
@@ -1408,9 +1741,22 @@ fn run_manager(
         list: None,
         active_id: 0,
         list_last_names: Vec::new(),
+        manual_override: None,
+        last_toggle_counter: crate::windows_input::PREVIEW_TOGGLE_COUNTER
+            .load(std::sync::atomic::Ordering::Acquire),
+        last_visibility_applied: true,
+        last_smart_hide_show: true,
+        last_interactive_applied: true,
     });
     let manager_ptr = Box::into_raw(manager);
     MANAGER_PTR.store(manager_ptr as usize, Ordering::Release);
+    // Publish the control HWND so other threads (the input listener)
+    // can PostMessage WM_USER_FORCE_ACTIVE for instant highlight
+    // updates on hotkey cycle.
+    CONTROL_HWND.store(
+        control_hwnd.0 as isize,
+        std::sync::atomic::Ordering::Release,
+    );
     unsafe {
         SetWindowLongPtrW(control_hwnd, GWLP_USERDATA, manager_ptr as isize);
         let _ = SetTimer(
@@ -1456,6 +1802,7 @@ fn run_manager(
     unsafe {
         let _ = UnhookWinEvent(win_event_hook);
         MANAGER_PTR.store(0, Ordering::Release);
+        CONTROL_HWND.store(0, std::sync::atomic::Ordering::Release);
         let _ = KillTimer(Some(control_hwnd), RECONCILE_TIMER_ID);
         if !manager_ptr.is_null() {
             // Drop the manager last — that drops the OwnedPreview map, which

@@ -15,6 +15,53 @@ pub struct CharacterHotkey {
     pub modifier: Option<u16>,
 }
 
+/// A per-character override for preview window dimensions. When present
+/// for a character name, takes priority over the global
+/// `preview_width`/`preview_height`. Width/height of zero are treated as
+/// "no override" so the resolver gracefully ignores partial entries.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// When mouse side-button cycling fires. `OnlyWhenEveFocused` keeps
+/// browser back/forward and other apps' XBUTTON bindings working — the
+/// hook only converts presses into cycle commands while an EVE client
+/// owns the foreground. `Never` keeps the hook installed (so the config
+/// panel can still capture XBUTTON for binding) but suppresses all
+/// cycle dispatches.
+///
+/// Linux backends don't yet implement focus-aware gating; on Unix
+/// `OnlyWhenEveFocused` is treated as `Always` to avoid a regression.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum MouseCycleMode {
+    Always,
+    Never,
+    OnlyWhenEveFocused,
+}
+
+impl MouseCycleMode {
+    /// Atomic packed representation. Used by the low-level mouse hook
+    /// so a single AtomicU8 store can be done from the daemon's
+    /// config-watch thread without locks.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            MouseCycleMode::Never => 0,
+            MouseCycleMode::Always => 1,
+            MouseCycleMode::OnlyWhenEveFocused => 2,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> MouseCycleMode {
+        match v {
+            0 => MouseCycleMode::Never,
+            2 => MouseCycleMode::OnlyWhenEveFocused,
+            _ => MouseCycleMode::Always,
+        }
+    }
+}
+
 /// How the visible-at-a-glance view of clients is rendered.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayMode {
@@ -42,6 +89,22 @@ pub struct LiveSettings {
     /// ignore mouse drags so they can't accidentally be knocked out of
     /// position mid-game. Click-to-activate still works on previews.
     pub positions_locked: bool,
+    /// Per-character preview-size overrides. Keyed by EVE character
+    /// name to survive list reorders and renames, mirroring the
+    /// `character_hotkeys` map.
+    pub preview_size_overrides: HashMap<String, PreviewSize>,
+    /// Live mirror of `Config::smart_hide_enabled`. The preview manager
+    /// reads it per reconcile so toggling in the panel takes effect
+    /// within ~100ms.
+    pub smart_hide_enabled: bool,
+    /// Live mirror of `Config::preview_opacity`. Pushed by the config
+    /// panel and the daemon's hot-reload thread.
+    pub preview_opacity: u8,
+    /// Live mirror of `Config::preview_hover_opacity`. See above.
+    pub preview_hover_opacity: u8,
+    /// Live mirror of `Config::previews_interactive`. When the manager
+    /// observes a change, it toggles WS_EX_TRANSPARENT on every preview.
+    pub previews_interactive: bool,
 }
 
 impl LiveSettings {
@@ -51,6 +114,11 @@ impl LiveSettings {
             preview_height: config.preview_height,
             display_mode: config.display_mode,
             positions_locked: config.positions_locked,
+            preview_size_overrides: config.preview_size_overrides.clone(),
+            smart_hide_enabled: config.smart_hide_enabled,
+            preview_opacity: config.preview_opacity,
+            preview_hover_opacity: config.preview_hover_opacity,
+            previews_interactive: config.previews_interactive,
         }))
     }
 }
@@ -64,8 +132,8 @@ pub struct Config {
     pub eve_height: u32,
     pub overlay_x: f32,
     pub overlay_y: f32,
-    #[serde(default = "default_enable_mouse")]
-    pub enable_mouse_buttons: bool,
+    #[serde(default = "default_mouse_cycle_mode")]
+    pub mouse_cycle_mode: MouseCycleMode,
     #[serde(default = "default_forward_button")]
     pub forward_button: u16, // BTN_SIDE (mouse button 9)
     #[serde(default = "default_backward_button")]
@@ -120,21 +188,79 @@ pub struct Config {
     /// without reassigning keys.
     #[serde(default)]
     pub character_hotkeys: HashMap<String, CharacterHotkey>,
+    /// Map of character name → preview-window size override. Empty by
+    /// default; entries override the global `preview_width`/`preview_height`
+    /// for that one character. Same keying rationale as `character_hotkeys`.
+    #[serde(default)]
+    pub preview_size_overrides: HashMap<String, PreviewSize>,
+    /// Virtual-key code that toggles preview-window visibility. 0 means
+    /// unbound. The toggle is sticky: each press flips a manual-override
+    /// flag that suspends Smart Hide until the user toggles back. Linux
+    /// builds carry the field for cross-platform serde compatibility but
+    /// ignore it (no Win32 RegisterHotKey equivalent yet).
+    #[serde(default)]
+    pub preview_toggle_key: u16,
+    /// Optional modifier VK for the preview-toggle hotkey (Shift / Ctrl
+    /// / Alt). None = bare key. Same semantics as `modifier_key`.
+    #[serde(default)]
+    pub preview_toggle_modifier: Option<u16>,
+    /// When true, the preview manager auto-shows previews only when at
+    /// least one EVE client is at least 90% unoccluded on its monitor
+    /// (none minimized, none buried). Composes with the manual show/hide
+    /// hotkey: an explicit hotkey toggle overrides Smart Hide until the
+    /// user toggles back. Opt-in (default off) to keep upgrade behavior
+    /// unchanged.
+    #[serde(default)]
+    pub smart_hide_enabled: bool,
+    /// Base preview-window opacity (0..=255, applied via WS_EX_LAYERED).
+    /// 255 = fully opaque, 0 = invisible. Default ~90% so previews are
+    /// non-intrusive over EVE without disappearing entirely.
+    #[serde(default = "default_preview_opacity")]
+    pub preview_opacity: u8,
+    /// Opacity used while the mouse cursor is over a preview window.
+    /// Defaults to fully opaque so the user can read titles / see the
+    /// thumbnail clearly when they hover.
+    #[serde(default = "default_preview_hover_opacity")]
+    pub preview_hover_opacity: u8,
+    /// When false, preview windows become fully click-through (using
+    /// WS_EX_TRANSPARENT). Hotkey-based cycling still works since it
+    /// doesn't touch the previews. Defaults to true so existing users
+    /// get unchanged behavior.
+    #[serde(default = "default_previews_interactive")]
+    pub previews_interactive: bool,
+    /// Enables modifier+wheel cycling globally. Off by default; turn
+    /// on to bind Shift+Wheel (or any modifier) to cycle clients.
+    #[serde(default)]
+    pub enable_wheel_cycle: bool,
+    /// VK code of the modifier that must be held for wheel-cycling to
+    /// fire. Default VK_SHIFT (0x10). The wheel passes through
+    /// untouched when the modifier isn't held.
+    #[serde(default = "default_wheel_modifier")]
+    pub wheel_cycle_modifier: u16,
+    /// Persisted size of the config panel window. Updated when the user
+    /// resizes the panel; restored at next launch. Width / height in
+    /// logical pixels.
+    #[serde(default = "default_config_panel_width")]
+    pub config_panel_width: u32,
+    #[serde(default = "default_config_panel_height")]
+    pub config_panel_height: u32,
 }
 
+// Linux: previous default was `enable_mouse_buttons = true`, matched by
+// `Always` here. `OnlyWhenEveFocused` would be a behaviour change since
+// Linux doesn't yet support focus-aware gating.
 #[cfg(unix)]
-fn default_enable_mouse() -> bool {
-    true
+fn default_mouse_cycle_mode() -> MouseCycleMode {
+    MouseCycleMode::Always
 }
 
-// Off by default on Windows — most users remap side buttons at the
-// driver level (Logi Options+, etc.) and use Nicotine's keyboard
-// hotkeys instead. When the native hook is on, it intercepts XBUTTON1/2
-// from games and browsers (back/forward) which surprises users who
-// didn't ask for cycling there.
+// Windows: previous default was `false`, matched by `Never`. Most
+// Windows users remap side buttons via Logi Options+ etc. so leaving
+// the native hook idle avoids surprising browser back/forward
+// interception.
 #[cfg(windows)]
-fn default_enable_mouse() -> bool {
-    false
+fn default_mouse_cycle_mode() -> MouseCycleMode {
+    MouseCycleMode::Never
 }
 
 #[cfg(unix)]
@@ -227,6 +353,32 @@ fn default_display_mode() -> DisplayMode {
     DisplayMode::Previews
 }
 
+fn default_preview_opacity() -> u8 {
+    230
+}
+
+fn default_preview_hover_opacity() -> u8 {
+    255
+}
+
+fn default_previews_interactive() -> bool {
+    true
+}
+
+fn default_wheel_modifier() -> u16 {
+    // VK_SHIFT — the most ergonomic Shift+Wheel combo and the one most
+    // users assume when given the option.
+    0x10
+}
+
+fn default_config_panel_width() -> u32 {
+    700
+}
+
+fn default_config_panel_height() -> u32 {
+    620
+}
+
 impl Config {
     fn config_dir() -> PathBuf {
         let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -299,7 +451,7 @@ impl Config {
             eve_height: display_height,
             overlay_x: 10.0,
             overlay_y: 10.0,
-            enable_mouse_buttons: default_enable_mouse(),
+            mouse_cycle_mode: default_mouse_cycle_mode(),
             forward_button: default_forward_button(),
             backward_button: default_backward_button(),
             enable_keyboard_buttons: default_enable_keyboard(),
@@ -318,6 +470,17 @@ impl Config {
             display_mode: default_display_mode(),
             positions_locked: false,
             character_hotkeys: HashMap::new(),
+            preview_size_overrides: HashMap::new(),
+            preview_toggle_key: 0,
+            preview_toggle_modifier: None,
+            smart_hide_enabled: false,
+            preview_opacity: default_preview_opacity(),
+            preview_hover_opacity: default_preview_hover_opacity(),
+            previews_interactive: default_previews_interactive(),
+            enable_wheel_cycle: false,
+            wheel_cycle_modifier: default_wheel_modifier(),
+            config_panel_width: default_config_panel_width(),
+            config_panel_height: default_config_panel_height(),
         }
     }
 
@@ -363,6 +526,20 @@ impl Config {
     pub fn eve_height_adjusted(&self) -> u32 {
         self.display_height - self.panel_height
     }
+
+    /// Resolve preview window dimensions for a given character. Returns
+    /// the override entry if present (and non-zero), else the globals.
+    /// Cross-platform helper but only consumed by the Windows preview
+    /// manager today.
+    #[cfg_attr(unix, allow(dead_code))]
+    pub fn preview_size_for(&self, character: &str) -> (u32, u32) {
+        if let Some(ovr) = self.preview_size_overrides.get(character) {
+            if ovr.width != 0 && ovr.height != 0 {
+                return (ovr.width, ovr.height);
+            }
+        }
+        (self.preview_width, self.preview_height)
+    }
 }
 
 #[cfg(test)]
@@ -379,7 +556,7 @@ mod tests {
             eve_height: 1080,
             overlay_x: 10.0,
             overlay_y: 10.0,
-            enable_mouse_buttons: true,
+            mouse_cycle_mode: MouseCycleMode::Always,
             forward_button: 276,
             backward_button: 275,
             enable_keyboard_buttons: false,
@@ -398,6 +575,17 @@ mod tests {
             display_mode: DisplayMode::Previews,
             positions_locked: false,
             character_hotkeys: HashMap::new(),
+            preview_size_overrides: HashMap::new(),
+            preview_toggle_key: 0,
+            preview_toggle_modifier: None,
+            smart_hide_enabled: false,
+            preview_opacity: 230,
+            preview_hover_opacity: 255,
+            previews_interactive: true,
+            enable_wheel_cycle: false,
+            wheel_cycle_modifier: 0x10,
+            config_panel_width: 700,
+            config_panel_height: 620,
         };
 
         // Height should be: 1080 - 40 = 1040
@@ -414,7 +602,7 @@ mod tests {
             eve_height: 1080,
             overlay_x: 10.0,
             overlay_y: 10.0,
-            enable_mouse_buttons: true,
+            mouse_cycle_mode: MouseCycleMode::Always,
             forward_button: 276,
             backward_button: 275,
             enable_keyboard_buttons: false,
@@ -433,6 +621,17 @@ mod tests {
             display_mode: DisplayMode::Previews,
             positions_locked: false,
             character_hotkeys: HashMap::new(),
+            preview_size_overrides: HashMap::new(),
+            preview_toggle_key: 0,
+            preview_toggle_modifier: None,
+            smart_hide_enabled: false,
+            preview_opacity: 230,
+            preview_hover_opacity: 255,
+            previews_interactive: true,
+            enable_wheel_cycle: false,
+            wheel_cycle_modifier: 0x10,
+            config_panel_width: 700,
+            config_panel_height: 620,
         };
 
         assert_eq!(config.eve_height_adjusted(), 1080);
@@ -448,7 +647,7 @@ mod tests {
             eve_height: 2160,
             overlay_x: 10.0,
             overlay_y: 10.0,
-            enable_mouse_buttons: true,
+            mouse_cycle_mode: MouseCycleMode::Always,
             forward_button: 276,
             backward_button: 275,
             enable_keyboard_buttons: false,
@@ -467,6 +666,17 @@ mod tests {
             display_mode: DisplayMode::Previews,
             positions_locked: false,
             character_hotkeys: HashMap::new(),
+            preview_size_overrides: HashMap::new(),
+            preview_toggle_key: 0,
+            preview_toggle_modifier: None,
+            smart_hide_enabled: false,
+            preview_opacity: 230,
+            preview_hover_opacity: 255,
+            previews_interactive: true,
+            enable_wheel_cycle: false,
+            wheel_cycle_modifier: 0x10,
+            config_panel_width: 700,
+            config_panel_height: 620,
         };
 
         let toml_str = toml::to_string(&config).unwrap();

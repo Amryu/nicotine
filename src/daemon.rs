@@ -112,6 +112,8 @@ impl Daemon {
         // within ~500ms — no daemon restart needed.
         let wm_clone = Arc::clone(&self.wm);
         let state_clone = Arc::clone(&self.state);
+        #[cfg(windows)]
+        let live_clone = Arc::clone(&self.live);
         let mut last_order: Option<Vec<String>> = if self.config.characters.is_empty() {
             None
         } else {
@@ -126,6 +128,8 @@ impl Daemon {
             u16,
             Option<u16>,
             std::collections::HashMap<String, crate::config::CharacterHotkey>,
+            u16,
+            Option<u16>,
         );
         #[cfg(windows)]
         fn hotkey_sig(c: &Config) -> HotkeySig {
@@ -135,6 +139,8 @@ impl Daemon {
                 c.backward_key,
                 c.modifier_key,
                 c.character_hotkeys.clone(),
+                c.preview_toggle_key,
+                c.preview_toggle_modifier,
             )
         }
         #[cfg(windows)]
@@ -175,11 +181,36 @@ impl Daemon {
                         crate::windows_input::resume_hotkeys();
                         last_hotkey_sig = new_sig;
                     }
-                    // Mouse-cycle toggle hot-reload. Atomic store is
-                    // cheap; no need to gate on a change check.
-                    crate::windows_input::set_mouse_cycle_enabled(
-                        fresh_config.enable_mouse_buttons,
+                    // Mouse-cycle mode + wheel-cycle hot-reload. Atomic
+                    // stores are cheap; no need to gate on change checks.
+                    crate::windows_input::set_mouse_cycle_mode(fresh_config.mouse_cycle_mode);
+                    crate::windows_input::set_wheel_cycle_enabled(fresh_config.enable_wheel_cycle);
+                    crate::windows_input::set_wheel_cycle_modifier(
+                        fresh_config.wheel_cycle_modifier,
                     );
+                    // Push per-character preview-size overrides AND Smart
+                    // Hide enable through LiveSettings so external edits
+                    // to config.toml flow into the preview manager within
+                    // one reconcile tick.
+                    {
+                        let mut live = live_clone.lock().unwrap();
+                        if live.preview_size_overrides != fresh_config.preview_size_overrides {
+                            live.preview_size_overrides =
+                                fresh_config.preview_size_overrides.clone();
+                        }
+                        if live.smart_hide_enabled != fresh_config.smart_hide_enabled {
+                            live.smart_hide_enabled = fresh_config.smart_hide_enabled;
+                        }
+                        if live.preview_opacity != fresh_config.preview_opacity {
+                            live.preview_opacity = fresh_config.preview_opacity;
+                        }
+                        if live.preview_hover_opacity != fresh_config.preview_hover_opacity {
+                            live.preview_hover_opacity = fresh_config.preview_hover_opacity;
+                        }
+                        if live.previews_interactive != fresh_config.previews_interactive {
+                            live.previews_interactive = fresh_config.previews_interactive;
+                        }
+                    }
                 }
             }
         });
@@ -202,7 +233,11 @@ impl Daemon {
 
     #[cfg(unix)]
     fn spawn_input_listeners(&self) {
-        if self.config.enable_mouse_buttons {
+        // Linux gate: spawn the evdev listener unless the user has
+        // explicitly chosen `Never`. `OnlyWhenEveFocused` is treated
+        // like `Always` here because we don't yet have a Wayland-portable
+        // way to ask "is the foreground window an EVE client?"
+        if self.config.mouse_cycle_mode != crate::config::MouseCycleMode::Never {
             let mouse_listener = MouseListener::new(self.config.clone());
             let wm_clone = Arc::clone(&self.wm);
             let state_clone = Arc::clone(&self.state);
@@ -214,7 +249,7 @@ impl Daemon {
                     eprintln!(
                         "Mouse buttons will not work. You can disable this warning by setting"
                     );
-                    eprintln!("'enable_mouse_buttons = false' in ~/.config/nicotine/config.toml");
+                    eprintln!("'mouse_cycle_mode = \"Never\"' in ~/.config/nicotine/config.toml");
                 }
             }
         }
