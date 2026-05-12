@@ -95,8 +95,8 @@ impl eframe::App for OverlayApp {
             self.last_applied_passthrough = Some(want_passthrough);
         }
 
-        let current_toggle = crate::toggle_state::PREVIEW_TOGGLE_COUNTER
-            .load(std::sync::atomic::Ordering::Acquire);
+        let current_toggle =
+            crate::toggle_state::PREVIEW_TOGGLE_COUNTER.load(std::sync::atomic::Ordering::Acquire);
         if current_toggle != self.last_toggle_counter {
             self.last_toggle_counter = current_toggle;
             let new_state = !self.effective_visible();

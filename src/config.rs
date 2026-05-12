@@ -15,19 +15,15 @@ pub struct CharacterHotkey {
     pub modifier: Option<u16>,
 }
 
-/// A per-character override for preview window dimensions. When present
-/// for a character name, takes priority over the global
-/// `preview_width`/`preview_height`. Width/height of zero are treated as
-/// "no override" so the resolver gracefully ignores partial entries.
+/// Zero width or height is treated as "no override" by `preview_size_for`.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub struct PreviewSize {
     pub width: u32,
     pub height: u32,
 }
 
-/// `OnlyWhenEveFocused` keeps browser back/forward and other apps'
-/// XBUTTON bindings intact. `Never` keeps the hook installed for the
-/// config panel to capture XBUTTON for binding but suppresses dispatch.
+/// `Never` keeps the LL hook installed so the config panel can still
+/// capture XBUTTON for binding; it just suppresses dispatch.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum MouseCycleMode {
     Always,
@@ -36,9 +32,6 @@ pub enum MouseCycleMode {
 }
 
 impl MouseCycleMode {
-    /// Atomic packed representation. Used by the low-level mouse hook
-    /// so a single AtomicU8 store can be done from the daemon's
-    /// config-watch thread without locks.
     #[cfg_attr(unix, allow(dead_code))]
     pub fn to_u8(self) -> u8 {
         match self {
@@ -89,17 +82,9 @@ pub struct LiveSettings {
     /// name to survive list reorders and renames, mirroring the
     /// `character_hotkeys` map.
     pub preview_size_overrides: HashMap<String, PreviewSize>,
-    /// Live mirror of `Config::smart_hide_enabled`. The preview manager
-    /// reads it per reconcile so toggling in the panel takes effect
-    /// within ~100ms.
     pub smart_hide_enabled: bool,
-    /// Live mirror of `Config::preview_opacity`. Pushed by the config
-    /// panel and the daemon's hot-reload thread.
     pub preview_opacity: u8,
-    /// Live mirror of `Config::preview_hover_opacity`. See above.
     pub preview_hover_opacity: u8,
-    /// Live mirror of `Config::previews_interactive`. When the manager
-    /// observes a change, it toggles WS_EX_TRANSPARENT on every preview.
     pub previews_interactive: bool,
 }
 
@@ -152,108 +137,57 @@ pub struct Config {
     pub keyboard_device_path: Option<String>,
     #[serde(default = "default_modifier_key")]
     pub modifier_key: Option<u16>,
-    /// Width of preview windows in pixels (Windows only). Single global value
-    /// — every preview gets the same size. Aspect ratio is preserved on the
-    /// thumbnail; the window is sized exactly as configured.
     #[serde(default = "default_preview_width")]
     pub preview_width: u32,
-    /// Height of preview windows in pixels (Windows only).
     #[serde(default = "default_preview_height")]
     pub preview_height: u32,
-    /// Whether DWM preview windows are spawned at all (Windows only). When
-    /// false, the daemon runs headless and you cycle via hotkeys / CLI only.
     #[serde(default = "default_show_previews")]
     pub show_previews: bool,
-    /// Ordered list of EVE character names. Forward/backward cycling
-    /// traverses this order; `switch N` maps target N to entry N-1.
-    /// Empty list = cycle through whatever order the window manager
-    /// reports (no stable ordering).
+    /// `switch N` maps target N to entry N-1. Empty list = detection order.
     #[serde(default)]
     pub characters: Vec<String>,
-    /// Which on-screen representation of running clients Nicotine shows.
     #[serde(default = "default_display_mode")]
     pub display_mode: DisplayMode,
-    /// When true, drag is disabled on preview windows and the client
-    /// list so they can't accidentally move during gameplay.
     #[serde(default)]
     pub positions_locked: bool,
-    /// Map of character name → hotkey for jump-to-character. When the
-    /// configured key (plus optional modifier) fires, Nicotine activates
-    /// that EVE client directly — independent of the forward/backward
-    /// cycle. Keyed by name so bindings follow reorders and renames
-    /// without reassigning keys.
+    /// Keyed by character name so bindings survive list reorders.
     #[serde(default)]
     pub character_hotkeys: HashMap<String, CharacterHotkey>,
-    /// Map of character name → preview-window size override. Empty by
-    /// default; entries override the global `preview_width`/`preview_height`
-    /// for that one character. Same keying rationale as `character_hotkeys`.
     #[serde(default)]
     pub preview_size_overrides: HashMap<String, PreviewSize>,
-    /// Virtual-key code that toggles preview-window visibility. 0 means
-    /// unbound. The toggle is sticky: each press flips a manual-override
-    /// flag that suspends Smart Hide until the user toggles back. Linux
-    /// builds carry the field for cross-platform serde compatibility but
-    /// ignore it (no Win32 RegisterHotKey equivalent yet).
+    /// 0 = unbound.
     #[serde(default)]
     pub preview_toggle_key: u16,
-    /// Optional modifier VK for the preview-toggle hotkey (Shift / Ctrl
-    /// / Alt). None = bare key. Same semantics as `modifier_key`.
     #[serde(default)]
     pub preview_toggle_modifier: Option<u16>,
-    /// When true, the preview manager auto-shows previews only when at
-    /// least one EVE client is at least 90% unoccluded on its monitor
-    /// (none minimized, none buried). Composes with the manual show/hide
-    /// hotkey: an explicit hotkey toggle overrides Smart Hide until the
-    /// user toggles back. Opt-in (default off) to keep upgrade behavior
-    /// unchanged.
     #[serde(default)]
     pub smart_hide_enabled: bool,
-    /// Base preview-window opacity (0..=255, applied via WS_EX_LAYERED).
-    /// 255 = fully opaque, 0 = invisible. Default ~90% so previews are
-    /// non-intrusive over EVE without disappearing entirely.
+    /// 0..=255; on Windows applied via WS_EX_LAYERED.
     #[serde(default = "default_preview_opacity")]
     pub preview_opacity: u8,
-    /// Opacity used while the mouse cursor is over a preview window.
-    /// Defaults to fully opaque so the user can read titles / see the
-    /// thumbnail clearly when they hover.
     #[serde(default = "default_preview_hover_opacity")]
     pub preview_hover_opacity: u8,
-    /// When false, preview windows become fully click-through (using
-    /// WS_EX_TRANSPARENT). Hotkey-based cycling still works since it
-    /// doesn't touch the previews. Defaults to true so existing users
-    /// get unchanged behavior.
+    /// false makes previews click-through (Windows: WS_EX_TRANSPARENT;
+    /// Linux: overlay passthrough via winit set_cursor_hittest).
     #[serde(default = "default_previews_interactive")]
     pub previews_interactive: bool,
-    /// Enables modifier+wheel cycling globally. Off by default; turn
-    /// on to bind Shift+Wheel (or any modifier) to cycle clients.
     #[serde(default)]
     pub enable_wheel_cycle: bool,
-    /// VK code of the modifier that must be held for wheel-cycling to
-    /// fire. Default VK_SHIFT (0x10). The wheel passes through
-    /// untouched when the modifier isn't held.
     #[serde(default = "default_wheel_modifier")]
     pub wheel_cycle_modifier: u16,
-    /// Persisted size of the config panel window. Updated when the user
-    /// resizes the panel; restored at next launch. Width / height in
-    /// logical pixels.
     #[serde(default = "default_config_panel_width")]
     pub config_panel_width: u32,
     #[serde(default = "default_config_panel_height")]
     pub config_panel_height: u32,
 }
 
-// Linux: previous default was `enable_mouse_buttons = true`, matched by
-// `Always` here. `OnlyWhenEveFocused` would be a behaviour change since
-// Linux doesn't yet support focus-aware gating.
 #[cfg(unix)]
 fn default_mouse_cycle_mode() -> MouseCycleMode {
     MouseCycleMode::Always
 }
 
-// Windows: previous default was `false`, matched by `Never`. Most
-// Windows users remap side buttons via Logi Options+ etc. so leaving
-// the native hook idle avoids surprising browser back/forward
-// interception.
+// Windows: most users remap their side buttons via Logi Options+ etc.,
+// so we'd hijack the buttons under their nose if we defaulted to Always.
 #[cfg(windows)]
 fn default_mouse_cycle_mode() -> MouseCycleMode {
     MouseCycleMode::Never
@@ -362,9 +296,7 @@ fn default_previews_interactive() -> bool {
 }
 
 fn default_wheel_modifier() -> u16 {
-    // VK_SHIFT — the most ergonomic Shift+Wheel combo and the one most
-    // users assume when given the option.
-    0x10
+    0x10 // VK_SHIFT
 }
 
 fn default_config_panel_width() -> u32 {
@@ -523,10 +455,6 @@ impl Config {
         self.display_height - self.panel_height
     }
 
-    /// Resolve preview window dimensions for a given character. Returns
-    /// the override entry if present (and non-zero), else the globals.
-    /// Cross-platform helper but only consumed by the Windows preview
-    /// manager today.
     #[cfg_attr(unix, allow(dead_code))]
     pub fn preview_size_for(&self, character: &str) -> (u32, u32) {
         if let Some(ovr) = self.preview_size_overrides.get(character) {

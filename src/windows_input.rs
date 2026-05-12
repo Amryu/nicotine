@@ -371,22 +371,18 @@ fn run_listener(
                 let name = character_lookup().lock().unwrap().get(&id).cloned();
                 if let Some(name) = name {
                     let minimize_inactive = minimize_inactive_lookup();
-                    let new_active_id = {
-                        let mut state_guard = state.lock().unwrap();
-                        if let Ok(active) = wm.get_active_window() {
-                            state_guard.sync_with_active(active);
-                        }
-                        if let Err(e) =
-                            state_guard.switch_to_character(&name, &*wm, minimize_inactive)
-                        {
-                            eprintln!("Character switch failed: {}", e);
-                        }
-                        let windows = state_guard.get_windows();
-                        let idx = state_guard.get_current_index();
-                        windows.get(idx).map(|w| w.id)
-                    };
-                    if let Some(id) = new_active_id {
+                    // Notify-before-activate — see perform_cycle.
+                    let predicted = state.lock().unwrap().peek_target_by_name(&name);
+                    if let Some(id) = predicted {
                         crate::preview_windows::notify_active_change(id);
+                    }
+                    let mut state_guard = state.lock().unwrap();
+                    if let Ok(active) = wm.get_active_window() {
+                        state_guard.sync_with_active(active);
+                    }
+                    if let Err(e) = state_guard.switch_to_character(&name, &*wm, minimize_inactive)
+                    {
+                        eprintln!("Character switch failed: {}", e);
                     }
                 }
             }
@@ -507,27 +503,24 @@ fn perform_cycle(
     direction: CycleDirection,
     minimize_inactive: bool,
 ) -> Result<()> {
-    let new_active_id = {
-        let mut state = state.lock().unwrap();
-        if let Ok(active) = wm.get_active_window() {
-            state.sync_with_active(active);
-        }
-        match direction {
-            CycleDirection::Forward => state.cycle_forward(&**wm, minimize_inactive)?,
-            CycleDirection::Backward => state.cycle_backward(&**wm, minimize_inactive)?,
-        }
-        // Compute the now-active id while we still hold the state lock,
-        // so the notification carries the freshly-cycled window rather
-        // than racing get_active_window against EVE's slow focus path.
-        let windows = state.get_windows();
-        let idx = state.get_current_index();
-        windows.get(idx).map(|w| w.id)
+    // Notify before activate_window — its AttachThreadInput fallback
+    // can take 50ms+ during which the border would otherwise lag.
+    let step = match direction {
+        CycleDirection::Forward => 1,
+        CycleDirection::Backward => -1,
     };
-    // Push the active-id straight to the preview manager so its red
-    // border updates the same frame as the cycle, without waiting for
-    // EVENT_SYSTEM_FOREGROUND to fire. No-op when previews are off.
-    if let Some(id) = new_active_id {
+    let predicted = state.lock().unwrap().peek_cycle(step);
+    if let Some(id) = predicted {
         crate::preview_windows::notify_active_change(id);
+    }
+
+    let mut state = state.lock().unwrap();
+    if let Ok(active) = wm.get_active_window() {
+        state.sync_with_active(active);
+    }
+    match direction {
+        CycleDirection::Forward => state.cycle_forward(&**wm, minimize_inactive)?,
+        CycleDirection::Backward => state.cycle_backward(&**wm, minimize_inactive)?,
     }
     Ok(())
 }

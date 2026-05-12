@@ -346,8 +346,6 @@ impl eframe::App for ConfigPanel {
                 });
             });
 
-        // ---- Body: tab strip + active tab content, wrapped in a
-        //      ScrollArea so each tab can independently overflow. ----
         const CENTRAL_V_MARGIN: f32 = 12.0;
         egui::CentralPanel::default()
             .frame(
@@ -387,10 +385,7 @@ impl eframe::App for ConfigPanel {
                     });
             });
 
-        // ---- Persist user-driven window resizes. ----
-        // eframe doesn't expose a clean "size changed" callback in 0.29,
-        // so we poll the inner viewport dimensions each frame and
-        // touch() when they differ from the last observed value.
+        // eframe 0.29 has no size-changed callback; poll the viewport.
         let inner = ctx.input(|i| i.viewport().inner_rect);
         if let Some(rect) = inner {
             let w = rect.width().round().max(0.0) as u32;
@@ -591,11 +586,6 @@ impl ConfigPanel {
                 }
             });
 
-            // Row 3 — per-character preview-size override. Compact:
-            // a toggle that switches between "use global size" and
-            // "custom size for this character." W/H inputs only appear
-            // when custom is on, so at a glance you can tell which
-            // characters have an override without reading values.
             let current_override = self.config.preview_size_overrides.get(&name).copied();
             let has_override = current_override.is_some();
             let mut toggle_clicked = false;
@@ -608,8 +598,6 @@ impl ConfigPanel {
             let mut size_dirty = false;
             ui.horizontal(|ui| {
                 ui.add_space(22.0);
-                // selectable_label makes the toggle state visible at a
-                // glance — same widget egui uses for the tab strip.
                 if ui.selectable_label(has_override, "Custom size").clicked() {
                     toggle_clicked = true;
                 }
@@ -637,10 +625,7 @@ impl ConfigPanel {
                 if has_override {
                     self.config.preview_size_overrides.remove(&name);
                 } else {
-                    // Seed the override with the current global dims so
-                    // toggling on doesn't suddenly resize the preview to
-                    // something arbitrary — the user can then tweak from
-                    // a sensible starting point.
+                    // Seed with the current globals so toggling on doesn't jump.
                     self.config.preview_size_overrides.insert(
                         name.clone(),
                         crate::config::PreviewSize {
@@ -678,8 +663,7 @@ impl ConfigPanel {
             }
         }
         if let Some(idx) = remove {
-            // Drop the per-character hotkey AND preview-size override for
-            // the removed name so stale map entries don't leak.
+            // Drop per-character maps so stale entries don't leak.
             let removed_name = self.config.characters.remove(idx);
             self.config.character_hotkeys.remove(&removed_name);
             if self
@@ -832,9 +816,7 @@ impl ConfigPanel {
                     .selected_text(selected_label)
                     .width(70.0)
                     .show_ui(ui, |ui| {
-                        // Skip the "None" entry — wheel cycling without a
-                        // modifier would hijack every scroll, surprising
-                        // users in every app.
+                        // Skip "None" — bare-wheel cycling would hijack every scroll.
                         for (code, label) in MODIFIER_CHOICES.iter().filter(|(c, _)| c.is_some()) {
                             if ui.selectable_label(new_mod == *code, *label).clicked() {
                                 new_mod = *code;
@@ -937,9 +919,6 @@ impl ConfigPanel {
                 live.preview_height = self.config.preview_height;
             }
 
-            // Opacity sliders. Stored as u8 (0..=255) but rendered as
-            // percent for readability. ~12 step at 0..=255 maps to 5%
-            // increments which is finer than the eye can discern.
             let prev_op = self.config.preview_opacity;
             let prev_hop = self.config.preview_hover_opacity;
             ui.horizontal(|ui| {
@@ -977,8 +956,7 @@ impl ConfigPanel {
 
             ui.add_space(4.0);
             let prev_interactive = self.config.previews_interactive;
-            // Inverted for the checkbox label — "visual only" reads more
-            // naturally than "not interactive".
+            // Inverted: "visual only" reads better than "not interactive".
             let mut visual_only = !self.config.previews_interactive;
             ui.checkbox(
                 &mut visual_only,
@@ -1006,8 +984,6 @@ impl ConfigPanel {
             ui.horizontal(|ui| {
                 ui.label("Show/Hide hotkey:");
 
-                // Modifier dropdown — shared with the per-character row's
-                // pattern so users get consistent UX.
                 let current_mod = self.config.preview_toggle_modifier;
                 let selected_label = MODIFIER_CHOICES
                     .iter()
@@ -1264,9 +1240,7 @@ fn vk_to_label(vk: u16) -> String {
         0x11 | 0xA2 | 0xA3 => "Ctrl".into(),
         0x12 | 0xA4 | 0xA5 => "Alt".into(),
         0xC0 => "`".into(),
-        // 0x30..=0x39 are already ASCII '0'..'9' — don't subtract 0x30
-        // (that yielded chr 0..9, which are control characters that
-        // render as empty / replacement glyphs depending on the font).
+        // VK 0x30..=0x39 already overlap ASCII '0'..'9'; no offset.
         0x30..=0x39 => format!("{}", vk as u8 as char),
         0x41..=0x5A => format!("{}", vk as u8 as char),
         0x26 => "Up".into(),
@@ -1288,10 +1262,7 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> Result<(), eframe:
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
         .expect("failed to decode embedded icon.png");
 
-    // Restore the user's last-known panel size. The tabbed layout
-    // (Feature 6) lets the user resize the window freely; per-frame
-    // auto-resize is gone. Clamp to a sensible minimum so a bad
-    // persisted value can't open the window too small to be usable.
+    // Clamp persisted size so a bad value can't open the window unusably small.
     let saved_w = (config.config_panel_width as f32).max(420.0);
     let saved_h = (config.config_panel_height as f32).max(360.0);
     let options = eframe::NativeOptions {

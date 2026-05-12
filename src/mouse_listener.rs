@@ -190,8 +190,7 @@ impl MouseListener {
                         let code = key.code();
 
                         // Only handle button press (value 1), ignore release (value 0)
-                        if event.value() == 1
-                            && (code == forward_button || code == backward_button)
+                        if event.value() == 1 && (code == forward_button || code == backward_button)
                         {
                             if mode == crate::config::MouseCycleMode::OnlyWhenEveFocused
                                 && !Self::foreground_is_eve(&wm)

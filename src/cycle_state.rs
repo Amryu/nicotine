@@ -113,6 +113,38 @@ impl CycleState {
         self.cycle_step(wm, minimize_inactive, -1)
     }
 
+    /// What `cycle_step(step)` would activate, with no side effects.
+    #[cfg_attr(unix, allow(dead_code))]
+    pub fn peek_cycle(&self, step: isize) -> Option<u32> {
+        if self.windows.is_empty() {
+            return None;
+        }
+        let cycle = self.cycle_indices();
+        if cycle.is_empty() {
+            return None;
+        }
+        let position = cycle.iter().position(|&i| i == self.current_index);
+        let next_position = match position {
+            Some(p) => {
+                let len = cycle.len() as isize;
+                (((p as isize + step) % len) + len) as usize % cycle.len()
+            }
+            None => {
+                if step > 0 {
+                    0
+                } else {
+                    cycle.len() - 1
+                }
+            }
+        };
+        self.windows.get(cycle[next_position]).map(|w| w.id)
+    }
+
+    #[cfg_attr(unix, allow(dead_code))]
+    pub fn peek_target_by_name(&self, name: &str) -> Option<u32> {
+        self.windows.iter().find(|w| w.title == name).map(|w| w.id)
+    }
+
     /// Advance through the cycle by `step` positions (1 = forward,
     /// -1 = backward). Wraps at both ends. Honors `character_order` if set.
     fn cycle_step(

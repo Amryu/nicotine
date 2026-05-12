@@ -83,10 +83,12 @@ static CONTROL_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicI
 const WM_USER_FORCE_ACTIVE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 100;
 
 /// Called by the input listener right after a successful cycle so the
-/// red active-client border updates the same tick instead of waiting
-/// on EVENT_SYSTEM_FOREGROUND. Best-effort: returns immediately if the
-/// manager hasn't been spawned yet (e.g., user has previews disabled).
+/// active-client border updates without waiting on EVENT_SYSTEM_FOREGROUND.
+/// Writes the global atomic synchronously (so any WM_PAINT that fires
+/// before the manager processes our message still renders the right
+/// border) and then posts WM_USER_FORCE_ACTIVE to force a redraw.
 pub fn notify_active_change(id: u32) {
+    ACTIVE_EVE_ID.store(id, std::sync::atomic::Ordering::Release);
     let raw = CONTROL_HWND.load(std::sync::atomic::Ordering::Acquire);
     if raw == 0 {
         return;
@@ -326,13 +328,6 @@ struct PreviewWindowState {
     dragged: bool,
     drag_origin_screen: (i32, i32),
     drag_origin_window: (i32, i32),
-    /// True when this preview's source EVE client is the system foreground
-    /// window. Read from WM_PAINT to choose border color. Updated by
-    /// reconcile via the GWLP_USERDATA pointer.
-    is_active: bool,
-    /// True between WM_MOUSEMOVE and WM_MOUSELEAVE for this preview.
-    /// Drives the opacity transition (base ↔ hover). Tracked per-window
-    /// because the user can hover one preview while others stay base.
     hover: bool,
 }
 
@@ -343,13 +338,19 @@ struct PreviewWindowState {
 static BASE_OPACITY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(230);
 static HOVER_OPACITY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
 
+/// Foreground EVE client id. Written by `update_active` AND
+/// `notify_active_change`, read by `preview_wnd_proc` in WM_PAINT so the
+/// border picks up the latest active state regardless of whether the
+/// per-window state struct has been updated yet (a WM_PAINT can fire
+/// before the manager thread has processed WM_USER_FORCE_ACTIVE).
+static ACTIVE_EVE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// One owned preview window. Drop unregisters the DWM thumbnail.
 struct OwnedPreview {
     hwnd: HWND,
     source_id: u32,
-    /// Mirror of `PreviewWindowState.is_active` kept here so reconcile
-    /// can detect changes without dereferencing the GWLP_USERDATA pointer
-    /// on every tick.
+    /// Cached so update_active only invalidates previews whose active
+    /// state actually flipped.
     is_active: bool,
 }
 
@@ -397,32 +398,18 @@ struct PreviewManager {
     /// InvalidateRect every 100ms otherwise produces a visible flicker
     /// and feels sluggish.
     list_last_names: Vec<String>,
-    /// Sticky user override on preview visibility, set by the show/hide
-    /// hotkey. `Some(true)` = force-shown, `Some(false)` = force-hidden,
-    /// `None` = automatic (Smart Hide controls, or always-shown when
-    /// Smart Hide is off). Outlives reconciles; cleared only by the
-    /// "Reset to auto" control in the config panel (or a Smart Hide
-    /// toggle, once that lands).
+    /// Sticky override from the show/hide hotkey: `Some(_)` wins over
+    /// Smart Hide; `None` falls back to it.
     manual_override: Option<bool>,
-    /// Snapshot of `PREVIEW_TOGGLE_COUNTER` from the last reconcile.
-    /// When the listener thread bumps the counter, we know to flip
-    /// `manual_override` on the next tick.
     last_toggle_counter: u32,
-    /// Most recent effective visibility decision. Cached so transitions
-    /// can be detected without re-deriving from scratch.
     #[allow(dead_code)]
     last_visibility_applied: bool,
-    /// Result of the most recent Smart Hide evaluation: `true` when at
-    /// least one EVE client is >=90% visible (or Smart Hide is disabled,
-    /// which collapses to "always show"). Consulted by
-    /// `previews_should_be_visible` only when `manual_override` is None.
     last_smart_hide_show: bool,
-    /// Cached interactive state so `apply_live_interactivity` is a
-    /// no-op when nothing changed. Initial value mirrors the Config
-    /// default (true) so newly-created previews don't need a special
-    /// case — they come up interactive and the first reconcile flips
-    /// them if needed.
     last_interactive_applied: bool,
+    /// Smart Hide's z-order walk is the slowest thing in reconcile; skip
+    /// most ticks so the manager thread stays responsive to hotkey-
+    /// driven WM_USER_FORCE_ACTIVE / WM_PAINT messages.
+    smart_hide_tick: u8,
 }
 
 /// Drop-guard for the list window — destroys the Win32 window and the
@@ -478,12 +465,6 @@ impl PreviewManager {
         self.update_active(active_id);
     }
 
-    /// Whether previews should currently be visible on screen, accounting
-    /// for sticky manual override AND Smart Hide. Manual override
-    /// (set by the show/hide hotkey) wins whenever it's `Some(_)`;
-    /// otherwise we fall back to the most recent Smart Hide evaluation
-    /// (which is `true` when Smart Hide is disabled, so the legacy
-    /// always-shown UX is preserved).
     fn previews_should_be_visible(&self) -> bool {
         match self.manual_override {
             Some(v) => v,
@@ -491,33 +472,32 @@ impl PreviewManager {
         }
     }
 
-    /// Recompute the Smart Hide decision and cache it. Called once per
-    /// reconcile tick. When disabled, force-true so manual_override is
-    /// the sole signal.
     fn refresh_smart_hide(&mut self) {
         let enabled = self.live.lock().unwrap().smart_hide_enabled;
         if !enabled {
             self.last_smart_hide_show = true;
             return;
         }
+        // Throttle to ~500ms. eve_visibility_ratios walks z-order per
+        // EVE client; on busy desktops that's tens of ms — running it
+        // every 100ms reconcile blocks the queue and stalls hotkey-
+        // driven border updates.
+        if self.smart_hide_tick > 0 {
+            self.smart_hide_tick -= 1;
+            return;
+        }
+        self.smart_hide_tick = 4;
         let ratios = self.wm.eve_visibility_ratios();
-        // SHOW when ANY client is >=90% visible. HIDE when none are
-        // (all minimized, occluded, or no clients at all).
         self.last_smart_hide_show = ratios.iter().any(|(_, r)| *r >= 0.90);
     }
 
-    /// Poll the hotkey-toggle counter and flip `manual_override` once
-    /// per fresh press. Called from the reconcile tick so the listener
-    /// thread doesn't need to touch the manager's state directly.
     fn poll_visibility_signals(&mut self) {
         let current =
             crate::toggle_state::PREVIEW_TOGGLE_COUNTER.load(std::sync::atomic::Ordering::Acquire);
         if current != self.last_toggle_counter {
             self.last_toggle_counter = current;
-            // First press from the auto state hides; subsequent presses
-            // alternate. We pick "hide first" because Smart Hide (when
-            // added) defaults to showing previews — the user who reaches
-            // for the toggle is typically trying to dismiss them.
+            // First press from auto-state hides — the user reaching for
+            // the toggle is usually trying to dismiss something.
             let next = match self.manual_override {
                 None => Some(false),
                 Some(v) => Some(!v),
@@ -526,12 +506,9 @@ impl PreviewManager {
         }
     }
 
-    /// Apply the current effective visibility to every preview host
-    /// window. Calls ShowWindow even when the global decision hasn't
-    /// changed since the last tick — this is the cheapest path to also
-    /// catch freshly-created previews that came up `WS_VISIBLE` while
-    /// the global state is "hidden." `ShowWindow` on a window already in
-    /// the requested state is a documented no-op.
+    /// Unconditional ShowWindow on every preview each tick — cheapest
+    /// way to also pick up freshly-created previews that came up
+    /// WS_VISIBLE while the global state was "hidden."
     fn apply_visibility(&mut self) {
         let want = self.previews_should_be_visible();
         self.last_visibility_applied = want;
@@ -549,14 +526,10 @@ impl PreviewManager {
     }
 
     fn reconcile_previews(&mut self) {
-        // Service any pending visibility hotkey presses BEFORE structural
-        // reconciliation so newly-created previews this tick are spawned
+        // Service hotkey presses first so newly-spawned previews come up
         // in the correct shown/hidden state.
         self.poll_visibility_signals();
 
-        // Apply any pending live-settings changes first — this lets the
-        // user drag the size sliders in the config panel and see preview
-        // windows resize in real time.
         self.apply_live_size();
         self.apply_live_opacity();
         self.apply_live_interactivity();
@@ -598,9 +571,8 @@ impl PreviewManager {
             }
         }
 
-        // Final pass — honor sticky hotkey override + Smart Hide.
-        // Done after creation so newly-spawned previews can be hidden
-        // immediately rather than flashing on screen for a frame.
+        // After preview creation so new ones can be hidden this tick
+        // without first flashing visible.
         self.refresh_smart_hide();
         self.apply_visibility();
     }
@@ -906,19 +878,15 @@ impl PreviewManager {
         rects
     }
 
-    /// Set the active-client highlight to whichever preview matches
-    /// `active_id`. Cheap to call repeatedly — only invalidates and
-    /// repaints when a preview's state actually flips.
-    ///
-    /// Also keeps the cycle's `current_index` in sync with whatever EVE
-    /// window the user has manually focused (via mouse click, Alt-Tab,
-    /// etc.). Without this, `current_index` only updates when our own
-    /// cycle commands run — so if the user activates B by hand, then
-    /// focuses a non-EVE app, then presses F11, the cycle would step
-    /// from wherever we last cycled to (say A) instead of from B,
-    /// looking like "cycle skipped a client."
+    /// Sync state.current_index with the OS foreground so a hand-focus
+    /// + later hotkey doesn't appear to skip a client.
     fn update_active(&mut self, active_id: u32) {
-        self.state.lock().unwrap().sync_with_active(active_id);
+        ACTIVE_EVE_ID.store(active_id, std::sync::atomic::Ordering::Release);
+        // try_lock so we don't wait on the listener while it's in
+        // activate_window — reconcile will resync next tick.
+        if let Ok(mut state) = self.state.try_lock() {
+            state.sync_with_active(active_id);
+        }
 
         for preview in self.previews.values_mut() {
             let now_active = preview.source_id == active_id;
@@ -927,10 +895,6 @@ impl PreviewManager {
             }
             preview.is_active = now_active;
             unsafe {
-                let ptr = GetWindowLongPtrW(preview.hwnd, GWLP_USERDATA) as *mut PreviewWindowState;
-                if !ptr.is_null() {
-                    (*ptr).is_active = now_active;
-                }
                 let _ = InvalidateRect(Some(preview.hwnd), None, true);
             }
         }
@@ -1019,7 +983,6 @@ impl PreviewManager {
             dragged: false,
             drag_origin_screen: (0, 0),
             drag_origin_window: (0, 0),
-            is_active: false,
             hover: false,
         });
         unsafe {
@@ -1112,7 +1075,9 @@ unsafe extern "system" fn preview_wnd_proc(
 
     match msg {
         WM_PAINT => {
-            paint_chrome(hwnd, &state.character_name, state.is_active);
+            let active =
+                state.source_id == ACTIVE_EVE_ID.load(std::sync::atomic::Ordering::Acquire);
+            paint_chrome(hwnd, &state.character_name, active);
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
@@ -1747,6 +1712,7 @@ fn run_manager(
         last_visibility_applied: true,
         last_smart_hide_show: true,
         last_interactive_applied: true,
+        smart_hide_tick: 0,
     });
     let manager_ptr = Box::into_raw(manager);
     MANAGER_PTR.store(manager_ptr as usize, Ordering::Release);
