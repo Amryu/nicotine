@@ -128,7 +128,7 @@ impl ConfigPanel {
         cc.egui_ctx.set_visuals(build_visuals());
 
         let last_observed_size = (config.config_panel_width, config.config_panel_height);
-        let tray = crate::tray::Tray::new(cc.egui_ctx.clone())
+        let tray = crate::tray::Tray::new()
             .map_err(|e| eprintln!("Tray init failed: {}", e))
             .ok();
         Self {
@@ -198,28 +198,17 @@ fn build_visuals() -> egui::Visuals {
 
 impl eframe::App for ConfigPanel {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(tray) = &self.tray {
-            while let Some(ev) = tray.try_recv_event() {
-                match ev {
-                    crate::tray::TrayEvent::Show => {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    }
-                    crate::tray::TrayEvent::Exit => {
-                        // eframe's Close command is a no-op on a hidden
-                        // window; the only way to actually terminate
-                        // from the tray is to bypass it.
-                        std::process::exit(0);
-                    }
-                }
+        // Close-to-tray: eframe pauses the event loop while a viewport
+        // is hidden via ViewportCommand::Visible(false), so the tray
+        // worker can't get the window back through eframe. Hide
+        // directly via Win32 ShowWindow so eframe keeps thinking the
+        // window is visible — the worker thread Win32-shows it on
+        // tray click.
+        if ctx.input(|i| i.viewport().close_requested()) && self.config.close_to_tray {
+            if let Some(tray) = &self.tray {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                tray.hide_window();
             }
-        }
-        if ctx.input(|i| i.viewport().close_requested())
-            && self.config.close_to_tray
-            && self.tray.is_some()
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
         // ---- Capture mode: listen for the next keypress ----

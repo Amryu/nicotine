@@ -1,25 +1,25 @@
-//! System-tray icon shared by the Windows config panel and the Linux
-//! overlay. Lives for the process lifetime; `try_recv_event` is polled
-//! from the eframe update loop.
+//! Windows system tray. Owns its own worker thread that handles both
+//! menu actions and left-click directly via Win32 — eframe pauses its
+//! event loop while the viewport is hidden, so anything routed through
+//! `update()` would queue forever.
 
 use anyhow::{Context, Result};
-use std::sync::mpsc;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use windows::core::PCWSTR;
+use windows::Win32::UI::WindowsAndMessaging::{
+    FindWindowW, SetForegroundWindow, ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE,
+};
 
-pub enum TrayEvent {
-    Show,
-    Exit,
-}
+const WINDOW_TITLE: &str = "Nicotine";
 
 #[allow(dead_code)]
 pub struct Tray {
     icon: TrayIcon,
-    rx: mpsc::Receiver<TrayEvent>,
 }
 
 impl Tray {
-    pub fn new(ctx: egui::Context) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let icon_data = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
             .context("decode tray icon")?;
         let icon = tray_icon::Icon::from_rgba(icon_data.rgba, icon_data.width, icon_data.height)
@@ -35,23 +35,16 @@ impl Tray {
             .with_tooltip("Nicotine")
             .with_icon(icon)
             .with_menu(Box::new(menu))
-            // Default is true on Windows — that swallows left-clicks
-            // into the context menu before we ever see them.
+            // Defaults to true on Windows — that captures left-clicks
+            // into the context menu before our handler sees them.
             .with_menu_on_left_click(false)
             .build()
             .context("build tray icon")?;
 
         let show_id = show.id().clone();
         let exit_id = exit.id().clone();
-        let (tx, rx) = mpsc::channel();
 
-        // The tray crate publishes events on global crossbeam channels.
-        // eframe stops calling update() when the window is hidden, so
-        // polling from the update loop would miss every event between
-        // hide and the next show. This worker thread forwards events
-        // to our mpsc and wakes the egui context so update() runs.
         std::thread::spawn(move || loop {
-            let mut woke = false;
             while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
                 let restore = matches!(
                     ev,
@@ -64,34 +57,54 @@ impl Tray {
                         ..
                     }
                 );
-                if restore && tx.send(TrayEvent::Show).is_ok() {
-                    woke = true;
+                if restore {
+                    show_window();
                 }
             }
             while let Ok(ev) = MenuEvent::receiver().try_recv() {
-                let mapped = if ev.id == show_id {
-                    Some(TrayEvent::Show)
+                if ev.id == show_id {
+                    show_window();
                 } else if ev.id == exit_id {
-                    Some(TrayEvent::Exit)
-                } else {
-                    None
-                };
-                if let Some(e) = mapped {
-                    if tx.send(e).is_ok() {
-                        woke = true;
-                    }
+                    std::process::exit(0);
                 }
-            }
-            if woke {
-                ctx.request_repaint();
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         });
 
-        Ok(Self { icon: tray, rx })
+        Ok(Self { icon: tray })
     }
 
-    pub fn try_recv_event(&self) -> Option<TrayEvent> {
-        self.rx.try_recv().ok()
+    pub fn hide_window(&self) {
+        hide_window();
+    }
+}
+
+fn find_window() -> Option<windows::Win32::Foundation::HWND> {
+    let title: Vec<u16> = WINDOW_TITLE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        match FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) {
+            Ok(h) if !h.0.is_null() => Some(h),
+            _ => None,
+        }
+    }
+}
+
+fn show_window() {
+    if let Some(hwnd) = find_window() {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+fn hide_window() {
+    if let Some(hwnd) = find_window() {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
     }
 }
