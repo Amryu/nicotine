@@ -511,7 +511,7 @@ impl PreviewManager {
     /// thread doesn't need to touch the manager's state directly.
     fn poll_visibility_signals(&mut self) {
         let current =
-            crate::windows_input::PREVIEW_TOGGLE_COUNTER.load(std::sync::atomic::Ordering::Acquire);
+            crate::toggle_state::PREVIEW_TOGGLE_COUNTER.load(std::sync::atomic::Ordering::Acquire);
         if current != self.last_toggle_counter {
             self.last_toggle_counter = current;
             // First press from the auto state hides; subsequent presses
@@ -1742,7 +1742,7 @@ fn run_manager(
         active_id: 0,
         list_last_names: Vec::new(),
         manual_override: None,
-        last_toggle_counter: crate::windows_input::PREVIEW_TOGGLE_COUNTER
+        last_toggle_counter: crate::toggle_state::PREVIEW_TOGGLE_COUNTER
             .load(std::sync::atomic::Ordering::Acquire),
         last_visibility_applied: true,
         last_smart_hide_show: true,

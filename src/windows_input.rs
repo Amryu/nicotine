@@ -30,14 +30,6 @@ const HOTKEY_PREVIEW_TOGGLE_ID: i32 = 1003;
 /// cycle IDs so the message dispatch can tell them apart by ID range.
 const HOTKEY_CHARACTER_BASE: i32 = 2000;
 
-/// Monotonic counter incremented every time the preview-toggle hotkey
-/// fires. The preview manager reads it once per reconcile tick (~100ms)
-/// and acts when the value has advanced since its last observation.
-/// Using a counter (rather than a boolean toggle) avoids a race where
-/// the manager misses a toggle that flipped twice in one tick.
-pub static PREVIEW_TOGGLE_COUNTER: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
-
 /// Lookup from per-character hotkey ID → the character name to
 /// activate on WM_HOTKEY. Rebuilt from scratch each time hotkeys are
 /// registered so stale entries never leak between config changes.
@@ -349,7 +341,7 @@ fn run_listener(
         // reconcile tick. Done before the cycle match so we don't fall
         // through into the cycle paths for the same WM_HOTKEY message.
         if msg.message == WM_HOTKEY && msg.wParam.0 as i32 == HOTKEY_PREVIEW_TOGGLE_ID {
-            PREVIEW_TOGGLE_COUNTER.fetch_add(1, Ordering::AcqRel);
+            crate::toggle_state::PREVIEW_TOGGLE_COUNTER.fetch_add(1, Ordering::AcqRel);
             continue;
         }
 

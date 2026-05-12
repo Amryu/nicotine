@@ -16,12 +16,15 @@ mod ipc;
 mod lock;
 mod paths;
 mod telemetry;
+mod toggle_state;
 mod window_manager;
 
 mod version_check;
 
 #[cfg(unix)]
 mod keyboard_listener;
+#[cfg(unix)]
+mod linux_input_state;
 #[cfg(unix)]
 mod mouse_listener;
 #[cfg(unix)]

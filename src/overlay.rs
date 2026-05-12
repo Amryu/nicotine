@@ -13,6 +13,11 @@ pub struct OverlayApp {
     overlay_window_id: Option<u32>,
     last_sync: Instant,
     last_index: usize,
+    last_applied_passthrough: Option<bool>,
+    last_toggle_counter: u32,
+    manual_override: Option<bool>,
+    smart_hide_show: bool,
+    last_applied_visible: Option<bool>,
 }
 
 impl OverlayApp {
@@ -65,7 +70,17 @@ impl OverlayApp {
             overlay_window_id: None,
             last_sync: Instant::now(),
             last_index: 0,
+            last_applied_passthrough: None,
+            last_toggle_counter: crate::toggle_state::PREVIEW_TOGGLE_COUNTER
+                .load(std::sync::atomic::Ordering::Acquire),
+            manual_override: None,
+            smart_hide_show: true,
+            last_applied_visible: None,
         }
+    }
+
+    fn effective_visible(&self) -> bool {
+        self.manual_override.unwrap_or(self.smart_hide_show)
     }
 }
 
@@ -73,6 +88,20 @@ impl eframe::App for OverlayApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Request repaint for smooth updates
         ctx.request_repaint();
+
+        let want_passthrough = !self.config.previews_interactive;
+        if self.last_applied_passthrough != Some(want_passthrough) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(want_passthrough));
+            self.last_applied_passthrough = Some(want_passthrough);
+        }
+
+        let current_toggle = crate::toggle_state::PREVIEW_TOGGLE_COUNTER
+            .load(std::sync::atomic::Ordering::Acquire);
+        if current_toggle != self.last_toggle_counter {
+            self.last_toggle_counter = current_toggle;
+            let new_state = !self.effective_visible();
+            self.manual_override = Some(new_state);
+        }
 
         // Read current index from file (instant, no process spawning)
         if let Some(index) = CycleState::read_index_from_file() {
@@ -88,11 +117,11 @@ impl eframe::App for OverlayApp {
         if now.duration_since(self.last_sync).as_millis() >= 500 {
             self.last_sync = now;
 
-            if let Ok(windows) = self.wm.get_eve_windows() {
+            let windows_result = self.wm.get_eve_windows();
+            if let Ok(windows) = &windows_result {
                 let mut state = self.state.lock().unwrap();
-                state.update_windows(windows);
+                state.update_windows(windows.clone());
 
-                // Resize window based on client count
                 let client_count = state.get_windows().len();
                 let base_height = 320.0_f32;
                 let per_client = 20.0_f32;
@@ -105,6 +134,24 @@ impl eframe::App for OverlayApp {
                     target_height,
                 )));
             }
+
+            self.smart_hide_show = if self.config.smart_hide_enabled {
+                let eve = windows_result.unwrap_or_default();
+                if eve.is_empty() {
+                    false
+                } else {
+                    let active = self.wm.get_active_window().unwrap_or(0);
+                    eve.iter().any(|w| w.id == active)
+                }
+            } else {
+                true
+            };
+        }
+
+        let want_visible = self.effective_visible();
+        if self.last_applied_visible != Some(want_visible) {
+            self.last_applied_visible = Some(want_visible);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(want_visible));
         }
 
         let red = egui::Color32::from_rgb(196, 30, 58);

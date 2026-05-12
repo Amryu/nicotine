@@ -25,15 +25,9 @@ pub struct PreviewSize {
     pub height: u32,
 }
 
-/// When mouse side-button cycling fires. `OnlyWhenEveFocused` keeps
-/// browser back/forward and other apps' XBUTTON bindings working — the
-/// hook only converts presses into cycle commands while an EVE client
-/// owns the foreground. `Never` keeps the hook installed (so the config
-/// panel can still capture XBUTTON for binding) but suppresses all
-/// cycle dispatches.
-///
-/// Linux backends don't yet implement focus-aware gating; on Unix
-/// `OnlyWhenEveFocused` is treated as `Always` to avoid a regression.
+/// `OnlyWhenEveFocused` keeps browser back/forward and other apps'
+/// XBUTTON bindings intact. `Never` keeps the hook installed for the
+/// config panel to capture XBUTTON for binding but suppresses dispatch.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum MouseCycleMode {
     Always,
@@ -45,6 +39,7 @@ impl MouseCycleMode {
     /// Atomic packed representation. Used by the low-level mouse hook
     /// so a single AtomicU8 store can be done from the daemon's
     /// config-watch thread without locks.
+    #[cfg_attr(unix, allow(dead_code))]
     pub fn to_u8(self) -> u8 {
         match self {
             MouseCycleMode::Never => 0,
@@ -53,6 +48,7 @@ impl MouseCycleMode {
         }
     }
 
+    #[cfg_attr(unix, allow(dead_code))]
     pub fn from_u8(v: u8) -> MouseCycleMode {
         match v {
             0 => MouseCycleMode::Never,

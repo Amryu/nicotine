@@ -2,9 +2,13 @@ use crate::config::Config;
 use crate::cycle_state::CycleState;
 use crate::window_manager::WindowManager;
 use anyhow::{Context, Result};
-use evdev::{Device, InputEventKind, Key};
+use evdev::{Device, InputEventKind, Key, RelativeAxisType};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+// Drivers may emit several REL_WHEEL events per detent.
+const WHEEL_DEBOUNCE: Duration = Duration::from_millis(80);
 
 pub struct MouseListener {
     config: Config,
@@ -114,25 +118,28 @@ impl MouseListener {
         wm: Arc<dyn WindowManager>,
         state: Arc<Mutex<CycleState>>,
     ) -> Result<std::thread::JoinHandle<()>> {
-        // `Never` mode bails; `Always` and `OnlyWhenEveFocused` both
-        // run on Linux (the focus check isn't yet portable across
-        // Wayland compositors).
         if self.config.mouse_cycle_mode == crate::config::MouseCycleMode::Never {
             anyhow::bail!("Mouse cycle mode is set to Never");
         }
 
+        let mode = self.config.mouse_cycle_mode;
         let forward_button = self.config.forward_button;
         let backward_button = self.config.backward_button;
         let mouse_device_name = self.config.mouse_device_name.clone();
         let mouse_device_path = self.config.mouse_device_path.clone();
         let minimize_inactive = self.config.minimize_inactive;
+        let wheel_enabled = self.config.enable_wheel_cycle;
+        let wheel_modifier = self.config.wheel_cycle_modifier;
 
         let handle = std::thread::spawn(move || {
             match Self::run_listener(
                 wm,
                 state,
+                mode,
                 forward_button,
                 backward_button,
+                wheel_enabled,
+                wheel_modifier,
                 mouse_device_name,
                 mouse_device_path,
                 minimize_inactive,
@@ -145,11 +152,15 @@ impl MouseListener {
         Ok(handle)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_listener(
         wm: Arc<dyn WindowManager>,
         state: Arc<Mutex<CycleState>>,
+        mode: crate::config::MouseCycleMode,
         forward_button: u16,
         backward_button: u16,
+        wheel_enabled: bool,
+        wheel_modifier: u16,
         mouse_device_name: Option<String>,
         mouse_device_path: Option<String>,
         minimize_inactive: bool,
@@ -166,32 +177,88 @@ impl MouseListener {
         // Grabbing would prevent normal mouse usage!
 
         println!(
-            "Listening for mouse buttons: forward={}, backward={}",
-            forward_button, backward_button
+            "Listening for mouse buttons: forward={}, backward={}, mode={:?}, wheel_enabled={}",
+            forward_button, backward_button, mode, wheel_enabled
         );
+
+        let mut last_wheel: Option<Instant> = None;
 
         loop {
             for event in device.fetch_events()? {
-                if let InputEventKind::Key(key) = event.kind() {
-                    let code = key.code();
+                match event.kind() {
+                    InputEventKind::Key(key) => {
+                        let code = key.code();
 
-                    // Only handle button press (value 1), ignore release (value 0)
-                    if event.value() == 1 {
-                        if code == forward_button {
-                            println!("Forward button pressed");
+                        // Only handle button press (value 1), ignore release (value 0)
+                        if event.value() == 1
+                            && (code == forward_button || code == backward_button)
+                        {
+                            if mode == crate::config::MouseCycleMode::OnlyWhenEveFocused
+                                && !Self::foreground_is_eve(&wm)
+                            {
+                                continue;
+                            }
+                            if code == forward_button {
+                                println!("Forward button pressed");
+                                if let Err(e) = Self::cycle_forward(&wm, &state, minimize_inactive)
+                                {
+                                    eprintln!("Failed to cycle forward: {}", e);
+                                }
+                            } else {
+                                println!("Backward button pressed");
+                                if let Err(e) = Self::cycle_backward(&wm, &state, minimize_inactive)
+                                {
+                                    eprintln!("Failed to cycle backward: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    InputEventKind::RelAxis(axis)
+                        if wheel_enabled && axis == RelativeAxisType::REL_WHEEL =>
+                    {
+                        if mode == crate::config::MouseCycleMode::Never {
+                            continue;
+                        }
+                        if mode == crate::config::MouseCycleMode::OnlyWhenEveFocused
+                            && !Self::foreground_is_eve(&wm)
+                        {
+                            continue;
+                        }
+                        if !crate::linux_input_state::modifier_held(wheel_modifier) {
+                            continue;
+                        }
+                        let now = Instant::now();
+                        if let Some(prev) = last_wheel {
+                            if now.duration_since(prev) < WHEEL_DEBOUNCE {
+                                continue;
+                            }
+                        }
+                        last_wheel = Some(now);
+                        let delta = event.value();
+                        if delta > 0 {
                             if let Err(e) = Self::cycle_forward(&wm, &state, minimize_inactive) {
                                 eprintln!("Failed to cycle forward: {}", e);
                             }
-                        } else if code == backward_button {
-                            println!("Backward button pressed");
+                        } else if delta < 0 {
                             if let Err(e) = Self::cycle_backward(&wm, &state, minimize_inactive) {
                                 eprintln!("Failed to cycle backward: {}", e);
                             }
                         }
                     }
+                    _ => {}
                 }
             }
         }
+    }
+
+    fn foreground_is_eve(wm: &Arc<dyn WindowManager>) -> bool {
+        let active = match wm.get_active_window() {
+            Ok(id) => id,
+            Err(_) => return false,
+        };
+        wm.get_eve_windows()
+            .map(|ws| ws.iter().any(|w| w.id == active))
+            .unwrap_or(false)
     }
 
     fn cycle_forward(

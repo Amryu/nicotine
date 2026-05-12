@@ -254,7 +254,12 @@ impl Daemon {
             }
         }
 
-        if self.config.enable_keyboard_buttons {
+        // Wheel cycling needs the keyboard listener for modifier state;
+        // the overlay toggle key is also tracked there.
+        if self.config.enable_keyboard_buttons
+            || self.config.enable_wheel_cycle
+            || self.config.preview_toggle_key != 0
+        {
             let keyboard_listener = KeyboardListener::new(self.config.clone());
             let wm_clone = Arc::clone(&self.wm);
             let state_clone = Arc::clone(&self.state);

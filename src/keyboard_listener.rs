@@ -68,19 +68,24 @@ impl KeyboardListener {
         anyhow::bail!("No keyboard device found in /dev/input")
     }
 
-    /// Run the keyboard event listener in a background thread
     pub fn spawn(
         &self,
         wm: Arc<dyn WindowManager>,
         state: Arc<Mutex<CycleState>>,
     ) -> Result<std::thread::JoinHandle<()>> {
-        if !self.config.enable_keyboard_buttons {
-            anyhow::bail!("Keyboard buttons are disabled in config");
+        if !self.config.enable_keyboard_buttons
+            && !self.config.enable_wheel_cycle
+            && self.config.preview_toggle_key == 0
+        {
+            anyhow::bail!("Keyboard listener not needed");
         }
 
+        let dispatch_cycles = self.config.enable_keyboard_buttons;
         let forward_key = self.config.forward_key;
         let backward_key = self.config.backward_key;
         let modifier_key = self.config.modifier_key;
+        let toggle_key = self.config.preview_toggle_key;
+        let toggle_modifier = self.config.preview_toggle_modifier;
         let keyboard_device_path = self.config.keyboard_device_path.clone();
         let minimize_inactive = self.config.minimize_inactive;
 
@@ -88,9 +93,12 @@ impl KeyboardListener {
             match Self::run_listener(
                 wm,
                 state,
+                dispatch_cycles,
                 forward_key,
                 backward_key,
                 modifier_key,
+                toggle_key,
+                toggle_modifier,
                 keyboard_device_path,
                 minimize_inactive,
             ) {
@@ -102,12 +110,16 @@ impl KeyboardListener {
         Ok(handle)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_listener(
         wm: Arc<dyn WindowManager>,
         state: Arc<Mutex<CycleState>>,
+        dispatch_cycles: bool,
         forward_key: u16,
         backward_key: u16,
         modifier_key: Option<u16>,
+        toggle_key: u16,
+        toggle_modifier: Option<u16>,
         keyboard_device_path: Option<String>,
         minimize_inactive: bool,
     ) -> Result<()> {
@@ -119,8 +131,8 @@ impl KeyboardListener {
         // Grabbing would prevent normal keyboard usage!
 
         println!(
-            "Listening for keyboard keys: forward={} backward={}",
-            forward_key, backward_key
+            "Listening for keyboard keys: forward={} backward={} (dispatch_cycles={})",
+            forward_key, backward_key, dispatch_cycles
         );
         let mut modifier_pressed = false;
 
@@ -128,31 +140,51 @@ impl KeyboardListener {
             for event in device.fetch_events()? {
                 if let InputEventKind::Key(key) = event.kind() {
                     let code = key.code();
-                    //let mut modifier_pressed = false;
+                    let value = event.value();
+
+                    crate::linux_input_state::set_modifier_state(code, value != 0);
+
                     if let Some(mod_key) = modifier_key {
                         if code == mod_key {
-                            println!("Modifier Pressed");
-                            modifier_pressed = event.value() != 0;
+                            modifier_pressed = value != 0;
                         }
                     }
-                    //print(code);
-                    if event.value() != 0 {
-                        // Have to check modifier + backwards first, otherwise if backward == forward it ignores the modifier flag
-                        if code == backward_key && modifier_pressed {
-                            println!("Backward + Modifier button pressed");
-                            if let Err(e) = Self::cycle_backward(&wm, &state, minimize_inactive) {
-                                eprintln!("Failed to cycle backward: {}", e);
-                            }
-                        } else if code == forward_key {
-                            println!("Forward button pressed");
-                            if let Err(e) = Self::cycle_forward(&wm, &state, minimize_inactive) {
-                                eprintln!("Failed to cycle forward: {}", e);
-                            }
-                        } else if code == backward_key {
-                            println!("Backward button pressed");
-                            if let Err(e) = Self::cycle_backward(&wm, &state, minimize_inactive) {
-                                eprintln!("Failed to cycle backward: {}", e);
-                            }
+
+                    if value == 0 {
+                        continue;
+                    }
+
+                    if toggle_key != 0 && code == toggle_key {
+                        let mod_ok = match toggle_modifier {
+                            Some(vk) => crate::linux_input_state::modifier_held(vk),
+                            None => true,
+                        };
+                        if mod_ok {
+                            crate::toggle_state::PREVIEW_TOGGLE_COUNTER
+                                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                            continue;
+                        }
+                    }
+
+                    if !dispatch_cycles {
+                        continue;
+                    }
+
+                    // Check modifier+backward first or forward_key == backward_key swallows it.
+                    if code == backward_key && modifier_pressed {
+                        println!("Backward + Modifier button pressed");
+                        if let Err(e) = Self::cycle_backward(&wm, &state, minimize_inactive) {
+                            eprintln!("Failed to cycle backward: {}", e);
+                        }
+                    } else if code == forward_key {
+                        println!("Forward button pressed");
+                        if let Err(e) = Self::cycle_forward(&wm, &state, minimize_inactive) {
+                            eprintln!("Failed to cycle forward: {}", e);
+                        }
+                    } else if code == backward_key {
+                        println!("Backward button pressed");
+                        if let Err(e) = Self::cycle_backward(&wm, &state, minimize_inactive) {
+                            eprintln!("Failed to cycle backward: {}", e);
                         }
                     }
                 }
