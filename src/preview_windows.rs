@@ -402,7 +402,6 @@ struct PreviewManager {
     /// Smart Hide; `None` falls back to it.
     manual_override: Option<bool>,
     last_toggle_counter: u32,
-    #[allow(dead_code)]
     last_visibility_applied: bool,
     last_smart_hide_show: bool,
     last_interactive_applied: bool,
@@ -511,11 +510,20 @@ impl PreviewManager {
     /// WS_VISIBLE while the global state was "hidden."
     fn apply_visibility(&mut self) {
         let want = self.previews_should_be_visible();
+        let was_visible = self.last_visibility_applied;
         self.last_visibility_applied = want;
         let cmd = if want { SW_SHOWNOACTIVATE } else { SW_HIDE };
+        // On a hidden→shown transition, re-apply the click-through flag.
+        // Empirically the ex-style bit can fail to register input
+        // routing changes on the first show after a hide.
+        let reapply_interactive = want && !was_visible;
+        let interactive = self.live.lock().unwrap().previews_interactive;
         for preview in self.previews.values() {
             unsafe {
                 let _ = ShowWindow(preview.hwnd, cmd);
+                if reapply_interactive {
+                    set_window_interactive(preview.hwnd, interactive);
+                }
             }
         }
         if let Some(list) = &self.list {
@@ -725,28 +733,7 @@ impl PreviewManager {
         self.last_interactive_applied = want_interactive;
         for preview in self.previews.values() {
             unsafe {
-                let style = GetWindowLongPtrW(preview.hwnd, GWL_EXSTYLE);
-                let transparent_bit = WS_EX_TRANSPARENT.0 as isize;
-                let new_style = if want_interactive {
-                    style & !transparent_bit
-                } else {
-                    style | transparent_bit
-                };
-                if new_style != style {
-                    SetWindowLongPtrW(preview.hwnd, GWL_EXSTYLE, new_style);
-                    // SWP_FRAMECHANGED tells the system to recompute the
-                    // window's non-client area, which is how the style
-                    // change actually takes effect for input routing.
-                    let _ = SetWindowPos(
-                        preview.hwnd,
-                        None,
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                    );
-                }
+                set_window_interactive(preview.hwnd, want_interactive);
             }
         }
     }
@@ -1009,6 +996,10 @@ impl PreviewManager {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
+            // Apply visual-only / click-through at creation so previews
+            // spawned mid-session inherit the current setting; otherwise
+            // they'd stay interactive until previews_interactive flipped.
+            set_window_interactive(hwnd, self.live.lock().unwrap().previews_interactive);
         }
 
         self.previews.insert(
@@ -1036,6 +1027,30 @@ impl PreviewManager {
 /// mirror the whole source window (including any title bar/border) — EVE's
 /// client area definition reportedly hides the actual game render surface,
 /// so SOURCECLIENTAREAONLY gives a blank preview.
+unsafe fn set_window_interactive(hwnd: HWND, interactive: bool) {
+    let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    let transparent_bit = WS_EX_TRANSPARENT.0 as isize;
+    let new_style = if interactive {
+        style & !transparent_bit
+    } else {
+        style | transparent_bit
+    };
+    if new_style != style {
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
+        // SWP_FRAMECHANGED forces a non-client recomputation, which is
+        // how the ex-style change actually takes effect for input routing.
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
 fn update_thumbnail_rect(thumbnail: Hthumbnail, width: i32, height: i32) {
     let border = px(BORDER_WIDTH);
     let title = px(TITLE_HEIGHT);

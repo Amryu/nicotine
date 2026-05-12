@@ -89,6 +89,12 @@ impl eframe::App for OverlayApp {
         // Request repaint for smooth updates
         ctx.request_repaint();
 
+        // No tray on Linux; close-to-hide keeps the daemon alive.
+        if ctx.input(|i| i.viewport().close_requested()) && self.config.close_to_tray {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
         let want_passthrough = !self.config.previews_interactive;
         if self.last_applied_passthrough != Some(want_passthrough) {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(want_passthrough));

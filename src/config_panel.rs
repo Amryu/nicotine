@@ -87,6 +87,7 @@ pub struct ConfigPanel {
     /// detect user resizes so we can persist the new size to the config
     /// without writing on every frame.
     last_observed_size: (u32, u32),
+    tray: Option<crate::tray::Tray>,
 }
 
 impl ConfigPanel {
@@ -127,6 +128,9 @@ impl ConfigPanel {
         cc.egui_ctx.set_visuals(build_visuals());
 
         let last_observed_size = (config.config_panel_width, config.config_panel_height);
+        let tray = crate::tray::Tray::new()
+            .map_err(|e| eprintln!("Tray init failed: {}", e))
+            .ok();
         Self {
             config,
             new_character_buffer: String::new(),
@@ -136,6 +140,7 @@ impl ConfigPanel {
             last_change: None,
             active_tab: Tab::Display,
             last_observed_size,
+            tray,
         }
     }
 
@@ -193,6 +198,28 @@ fn build_visuals() -> egui::Visuals {
 
 impl eframe::App for ConfigPanel {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(tray) = &self.tray {
+            while let Some(ev) = tray.try_recv_event() {
+                match ev {
+                    crate::tray::TrayEvent::Show => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    crate::tray::TrayEvent::Exit => {
+                        self.config.close_to_tray = false;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            }
+        }
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.config.close_to_tray
+            && self.tray.is_some()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
         // ---- Capture mode: listen for the next keypress ----
         // Runs before any widget draw so the event stream we inspect
         // reflects what the user just did.
@@ -376,6 +403,8 @@ impl eframe::App for ConfigPanel {
                     .auto_shrink([false, false])
                     .show(ui, |ui| match self.active_tab {
                         Tab::Display => {
+                            self.draw_application_section(ui);
+                            ui.add_space(20.0);
                             self.draw_display_mode_section(ui);
                             ui.add_space(20.0);
                             self.draw_previews_section(ui);
@@ -428,6 +457,31 @@ impl ConfigPanel {
                 .color(NICOTINE_RED),
         );
         ui.separator();
+    }
+
+    fn draw_application_section(&mut self, ui: &mut egui::Ui) {
+        Self::draw_section_header(ui, "Application");
+
+        let prev_tray = self.config.close_to_tray;
+        ui.checkbox(
+            &mut self.config.close_to_tray,
+            "Close to tray (keep daemon running)",
+        );
+        if self.config.close_to_tray != prev_tray {
+            self.touch();
+        }
+
+        let prev_auto = self.config.auto_start;
+        ui.checkbox(&mut self.config.auto_start, "Auto-start on login");
+        if self.config.auto_start != prev_auto {
+            if let Err(e) = crate::autostart::set_enabled(self.config.auto_start) {
+                eprintln!("autostart toggle failed: {}", e);
+                // Roll back the checkbox so the UI reflects reality.
+                self.config.auto_start = prev_auto;
+            } else {
+                self.touch();
+            }
+        }
     }
 
     fn draw_display_mode_section(&mut self, ui: &mut egui::Ui) {
@@ -1254,11 +1308,11 @@ fn vk_to_label(vk: u16) -> String {
 /// Open the config panel as a top-level window. Blocks until the user
 /// closes the window. Takes a shared LiveSettings so slider changes can
 /// be applied to the running preview manager instantly.
-pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> Result<(), eframe::Error> {
-    // Load the Nicotine icon for the window chrome + taskbar + alt-tab.
-    // Baked into the binary via include_bytes so there's no external
-    // asset to lose on install. from_png_bytes goes through eframe's
-    // bundled `image` crate (already pulled in with the png feature).
+pub fn run(
+    config: Config,
+    live: Arc<Mutex<LiveSettings>>,
+    start_hidden: bool,
+) -> Result<(), eframe::Error> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
         .expect("failed to decode embedded icon.png");
 
@@ -1270,6 +1324,7 @@ pub fn run(config: Config, live: Arc<Mutex<LiveSettings>>) -> Result<(), eframe:
             .with_inner_size([saved_w, saved_h])
             .with_min_inner_size([420.0, 360.0])
             .with_resizable(true)
+            .with_visible(!start_hidden)
             .with_title("Nicotine")
             .with_icon(icon),
         ..Default::default()

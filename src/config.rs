@@ -179,6 +179,10 @@ pub struct Config {
     pub config_panel_width: u32,
     #[serde(default = "default_config_panel_height")]
     pub config_panel_height: u32,
+    #[serde(default = "default_close_to_tray")]
+    pub close_to_tray: bool,
+    #[serde(default)]
+    pub auto_start: bool,
 }
 
 #[cfg(unix)]
@@ -307,6 +311,10 @@ fn default_config_panel_height() -> u32 {
     620
 }
 
+fn default_close_to_tray() -> bool {
+    true
+}
+
 impl Config {
     fn config_dir() -> PathBuf {
         let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -409,6 +417,8 @@ impl Config {
             wheel_cycle_modifier: default_wheel_modifier(),
             config_panel_width: default_config_panel_width(),
             config_panel_height: default_config_panel_height(),
+            close_to_tray: default_close_to_tray(),
+            auto_start: false,
         }
     }
 
@@ -510,6 +520,8 @@ mod tests {
             wheel_cycle_modifier: 0x10,
             config_panel_width: 700,
             config_panel_height: 620,
+            close_to_tray: true,
+            auto_start: false,
         };
 
         // Height should be: 1080 - 40 = 1040
@@ -556,6 +568,8 @@ mod tests {
             wheel_cycle_modifier: 0x10,
             config_panel_width: 700,
             config_panel_height: 620,
+            close_to_tray: true,
+            auto_start: false,
         };
 
         assert_eq!(config.eve_height_adjusted(), 1080);
@@ -601,6 +615,8 @@ mod tests {
             wheel_cycle_modifier: 0x10,
             config_panel_width: 700,
             config_panel_height: 620,
+            close_to_tray: true,
+            auto_start: false,
         };
 
         let toml_str = toml::to_string(&config).unwrap();

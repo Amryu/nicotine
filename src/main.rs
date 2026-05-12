@@ -7,6 +7,7 @@
 // GUI-first; the daemon subcommand still works, it just runs headless.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod autostart;
 mod config;
 #[cfg(windows)]
 mod config_panel;
@@ -17,6 +18,8 @@ mod lock;
 mod paths;
 mod telemetry;
 mod toggle_state;
+#[cfg(windows)]
+mod tray;
 mod window_manager;
 
 mod version_check;
@@ -119,7 +122,8 @@ enum CycleOp {
 }
 
 #[cfg(unix)]
-fn start_command(wm: Arc<dyn WindowManager>, config: Config) -> Result<()> {
+fn start_command(wm: Arc<dyn WindowManager>, config: Config, start_hidden: bool) -> Result<()> {
+    let _ = start_hidden; // Linux has no tray; overlay always visible at launch.
     let live = LiveSettings::from_config(&config);
     let daemonize = Daemonize::new().working_directory("/tmp").umask(0o027);
 
@@ -161,7 +165,7 @@ fn start_command(wm: Arc<dyn WindowManager>, config: Config) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn start_command(wm: Arc<dyn WindowManager>, config: Config) -> Result<()> {
+fn start_command(wm: Arc<dyn WindowManager>, config: Config, start_hidden: bool) -> Result<()> {
     let live = LiveSettings::from_config(&config);
 
     // Kick off the GitHub-release check on a detached thread. The
@@ -192,7 +196,7 @@ fn start_command(wm: Arc<dyn WindowManager>, config: Config) -> Result<()> {
     // thread terminates with it. The shared LiveSettings lets the panel
     // push slider changes straight to the preview manager without
     // waiting for a save-to-disk round-trip.
-    if let Err(e) = config_panel::run(config, live) {
+    if let Err(e) = config_panel::run(config, live, start_hidden) {
         eprintln!("Config panel error: {}", e);
     }
     Ok(())
@@ -275,6 +279,7 @@ fn main() -> Result<()> {
 
     let args: Vec<String> = env::args().collect();
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("");
+    let start_hidden = args.iter().any(|a| a == "--autostart");
 
     let config = Config::load()?;
     let wm = create_window_manager()?;
@@ -288,7 +293,7 @@ fn main() -> Result<()> {
                 version_check::print_update_notification(&new_version, &url);
             }
 
-            start_command(wm, config)?;
+            start_command(wm, config, start_hidden)?;
         }
 
         "daemon" => {
@@ -359,7 +364,7 @@ fn main() -> Result<()> {
         // start path rather than printing help to a hidden console.
         #[cfg(windows)]
         "" => {
-            start_command(wm, config)?;
+            start_command(wm, config, start_hidden)?;
         }
 
         // Handle switch command or numeric shorthand
