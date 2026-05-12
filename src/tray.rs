@@ -3,7 +3,8 @@
 //! from the eframe update loop.
 
 use anyhow::{Context, Result};
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
+use std::sync::mpsc;
+use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 pub enum TrayEvent {
@@ -14,12 +15,11 @@ pub enum TrayEvent {
 #[allow(dead_code)]
 pub struct Tray {
     icon: TrayIcon,
-    show_id: MenuId,
-    exit_id: MenuId,
+    rx: mpsc::Receiver<TrayEvent>,
 }
 
 impl Tray {
-    pub fn new() -> Result<Self> {
+    pub fn new(ctx: egui::Context) -> Result<Self> {
         let icon_data = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
             .context("decode tray icon")?;
         let icon = tray_icon::Icon::from_rgba(icon_data.rgba, icon_data.width, icon_data.height)
@@ -38,40 +38,57 @@ impl Tray {
             .build()
             .context("build tray icon")?;
 
-        Ok(Self {
-            icon: tray,
-            show_id: show.id().clone(),
-            exit_id: exit.id().clone(),
-        })
+        let show_id = show.id().clone();
+        let exit_id = exit.id().clone();
+        let (tx, rx) = mpsc::channel();
+
+        // The tray crate publishes events on global crossbeam channels.
+        // eframe stops calling update() when the window is hidden, so
+        // polling from the update loop would miss every event between
+        // hide and the next show. This worker thread forwards events
+        // to our mpsc and wakes the egui context so update() runs.
+        std::thread::spawn(move || loop {
+            let mut woke = false;
+            while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+                let restore = matches!(
+                    ev,
+                    TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } | TrayIconEvent::DoubleClick {
+                        button: MouseButton::Left,
+                        ..
+                    }
+                );
+                if restore && tx.send(TrayEvent::Show).is_ok() {
+                    woke = true;
+                }
+            }
+            while let Ok(ev) = MenuEvent::receiver().try_recv() {
+                let mapped = if ev.id == show_id {
+                    Some(TrayEvent::Show)
+                } else if ev.id == exit_id {
+                    Some(TrayEvent::Exit)
+                } else {
+                    None
+                };
+                if let Some(e) = mapped {
+                    if tx.send(e).is_ok() {
+                        woke = true;
+                    }
+                }
+            }
+            if woke {
+                ctx.request_repaint();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+
+        Ok(Self { icon: tray, rx })
     }
 
     pub fn try_recv_event(&self) -> Option<TrayEvent> {
-        // Left-click → Show. Right-click is reserved for the context
-        // menu (handled internally by tray-icon).
-        if let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-            let show = matches!(
-                ev,
-                TrayIconEvent::Click {
-                    button: MouseButton::Left,
-                    button_state: MouseButtonState::Up,
-                    ..
-                } | TrayIconEvent::DoubleClick {
-                    button: MouseButton::Left,
-                    ..
-                }
-            );
-            if show {
-                return Some(TrayEvent::Show);
-            }
-        }
-        if let Ok(ev) = MenuEvent::receiver().try_recv() {
-            if ev.id == self.show_id {
-                return Some(TrayEvent::Show);
-            }
-            if ev.id == self.exit_id {
-                return Some(TrayEvent::Exit);
-            }
-        }
-        None
+        self.rx.try_recv().ok()
     }
 }

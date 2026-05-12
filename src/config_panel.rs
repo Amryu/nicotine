@@ -128,7 +128,7 @@ impl ConfigPanel {
         cc.egui_ctx.set_visuals(build_visuals());
 
         let last_observed_size = (config.config_panel_width, config.config_panel_height);
-        let tray = crate::tray::Tray::new()
+        let tray = crate::tray::Tray::new(cc.egui_ctx.clone())
             .map_err(|e| eprintln!("Tray init failed: {}", e))
             .ok();
         Self {
