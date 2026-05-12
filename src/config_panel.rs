@@ -206,8 +206,10 @@ impl eframe::App for ConfigPanel {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     }
                     crate::tray::TrayEvent::Exit => {
-                        self.config.close_to_tray = false;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        // eframe's Close command is a no-op on a hidden
+                        // window; the only way to actually terminate
+                        // from the tray is to bypass it.
+                        std::process::exit(0);
                     }
                 }
             }

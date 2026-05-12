@@ -35,6 +35,9 @@ impl Tray {
             .with_tooltip("Nicotine")
             .with_icon(icon)
             .with_menu(Box::new(menu))
+            // Default is true on Windows — that swallows left-clicks
+            // into the context menu before we ever see them.
+            .with_menu_on_left_click(false)
             .build()
             .context("build tray icon")?;
 
