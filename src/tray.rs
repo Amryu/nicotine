@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
-use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 pub enum TrayEvent {
     Show,
@@ -46,11 +46,21 @@ impl Tray {
     }
 
     pub fn try_recv_event(&self) -> Option<TrayEvent> {
+        // Left-click → Show. Right-click is reserved for the context
+        // menu (handled internally by tray-icon).
         if let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-            if matches!(
+            let show = matches!(
                 ev,
-                TrayIconEvent::DoubleClick { .. } | TrayIconEvent::Click { .. }
-            ) {
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } | TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                }
+            );
+            if show {
                 return Some(TrayEvent::Show);
             }
         }
