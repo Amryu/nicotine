@@ -509,18 +509,24 @@ fn perform_cycle(
         CycleDirection::Forward => 1,
         CycleDirection::Backward => -1,
     };
-    let predicted = state.lock().unwrap().peek_cycle(step);
+    // Sync with the actual foreground window before predicting, so the
+    // prediction matches what cycle_step() will actually do. Otherwise,
+    // if the user manually focused a different EVE client since the last
+    // cycle, peek_cycle would step from the stale current_index and we'd
+    // flash the red border on the wrong preview until cycle_step (which
+    // does sync) corrects it on the next foreground event.
+    let active = wm.get_active_window().ok();
+    let mut state_guard = state.lock().unwrap();
+    if let Some(active) = active {
+        state_guard.sync_with_active(active);
+    }
+    let predicted = state_guard.peek_cycle(step);
     if let Some(id) = predicted {
         crate::preview_windows::notify_active_change(id);
     }
-
-    let mut state = state.lock().unwrap();
-    if let Ok(active) = wm.get_active_window() {
-        state.sync_with_active(active);
-    }
     match direction {
-        CycleDirection::Forward => state.cycle_forward(&**wm, minimize_inactive)?,
-        CycleDirection::Backward => state.cycle_backward(&**wm, minimize_inactive)?,
+        CycleDirection::Forward => state_guard.cycle_forward(&**wm, minimize_inactive)?,
+        CycleDirection::Backward => state_guard.cycle_backward(&**wm, minimize_inactive)?,
     }
     Ok(())
 }
