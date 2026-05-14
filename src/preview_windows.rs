@@ -404,7 +404,6 @@ struct PreviewManager {
     last_toggle_counter: u32,
     last_visibility_applied: bool,
     last_smart_hide_show: bool,
-    last_interactive_applied: bool,
     /// Smart Hide's z-order walk is the slowest thing in reconcile; skip
     /// most ticks so the manager thread stays responsive to hotkey-
     /// driven WM_USER_FORCE_ACTIVE / WM_PAINT messages.
@@ -507,23 +506,21 @@ impl PreviewManager {
 
     /// Unconditional ShowWindow on every preview each tick — cheapest
     /// way to also pick up freshly-created previews that came up
-    /// WS_VISIBLE while the global state was "hidden."
+    /// WS_VISIBLE while the global state was "hidden." Also reasserts
+    /// WS_EX_TRANSPARENT alongside SW_HIDE: SW_HIDE on a WS_EX_LAYERED
+    /// window can still route WM_LBUTTONDOWN to its wnd_proc, and the
+    /// preview's click handler activates the source EVE client — so a
+    /// click on a "hidden" preview's old rect looked to the user like
+    /// hidden previews were blocking clicks to non-EVE windows.
     fn apply_visibility(&mut self) {
         let want = self.previews_should_be_visible();
-        let was_visible = self.last_visibility_applied;
         self.last_visibility_applied = want;
         let cmd = if want { SW_SHOWNOACTIVATE } else { SW_HIDE };
-        // On a hidden→shown transition, re-apply the click-through flag.
-        // Empirically the ex-style bit can fail to register input
-        // routing changes on the first show after a hide.
-        let reapply_interactive = want && !was_visible;
-        let interactive = self.live.lock().unwrap().previews_interactive;
+        let target_interactive = want && self.live.lock().unwrap().previews_interactive;
         for preview in self.previews.values() {
             unsafe {
                 let _ = ShowWindow(preview.hwnd, cmd);
-                if reapply_interactive {
-                    set_window_interactive(preview.hwnd, interactive);
-                }
+                set_window_interactive(preview.hwnd, target_interactive);
             }
         }
         if let Some(list) = &self.list {
@@ -540,7 +537,6 @@ impl PreviewManager {
 
         self.apply_live_size();
         self.apply_live_opacity();
-        self.apply_live_interactivity();
 
         let windows = {
             let s = self.state.lock().unwrap();
@@ -718,24 +714,6 @@ impl PreviewManager {
 
         self.list = Some(OwnedListWindow { hwnd });
         Ok(())
-    }
-
-    /// Toggle the click-through extended style on every preview to
-    /// match `LiveSettings::previews_interactive`. Only walks windows
-    /// when the value actually changed since last reconcile —
-    /// SetWindowLongPtrW + SWP_FRAMECHANGED triggers DWM compositing
-    /// work, so we don't want to spam it.
-    fn apply_live_interactivity(&mut self) {
-        let want_interactive = self.live.lock().unwrap().previews_interactive;
-        if want_interactive == self.last_interactive_applied {
-            return;
-        }
-        self.last_interactive_applied = want_interactive;
-        for preview in self.previews.values() {
-            unsafe {
-                set_window_interactive(preview.hwnd, want_interactive);
-            }
-        }
     }
 
     /// Read the latest opacity values from LiveSettings, mirror them
@@ -997,9 +975,13 @@ impl PreviewManager {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
             // Apply visual-only / click-through at creation so previews
-            // spawned mid-session inherit the current setting; otherwise
-            // they'd stay interactive until previews_interactive flipped.
-            set_window_interactive(hwnd, self.live.lock().unwrap().previews_interactive);
+            // spawned mid-session inherit the current setting. Force
+            // click-through if previews are currently meant to be hidden
+            // — otherwise a preview created during a hidden phase would
+            // catch clicks at its spawn rect until the next reconcile.
+            let want_interactive =
+                self.previews_should_be_visible() && self.live.lock().unwrap().previews_interactive;
+            set_window_interactive(hwnd, want_interactive);
         }
 
         self.previews.insert(
@@ -1726,7 +1708,6 @@ fn run_manager(
             .load(std::sync::atomic::Ordering::Acquire),
         last_visibility_applied: true,
         last_smart_hide_show: true,
-        last_interactive_applied: true,
         smart_hide_tick: 0,
     });
     let manager_ptr = Box::into_raw(manager);
