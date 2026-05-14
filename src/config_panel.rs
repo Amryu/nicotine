@@ -741,6 +741,53 @@ impl ConfigPanel {
     }
 
     fn draw_hotkeys_section(&mut self, ui: &mut egui::Ui) {
+        Self::draw_section_header(ui, "Show/Hide Previews");
+
+        ui.horizontal(|ui| {
+            ui.label("Hotkey:");
+
+            let current_mod = self.config.preview_toggle_modifier;
+            let selected_label = MODIFIER_CHOICES
+                .iter()
+                .find(|(m, _)| *m == current_mod)
+                .map(|(_, l)| *l)
+                .unwrap_or("None");
+            let mut new_mod = current_mod;
+            egui::ComboBox::from_id_salt("preview_toggle_mod")
+                .selected_text(selected_label)
+                .width(70.0)
+                .show_ui(ui, |ui| {
+                    for (code, label) in MODIFIER_CHOICES {
+                        if ui.selectable_label(new_mod == *code, *label).clicked() {
+                            new_mod = *code;
+                        }
+                    }
+                });
+            if new_mod != current_mod {
+                self.config.preview_toggle_modifier = new_mod;
+                self.touch();
+            }
+
+            let label = if self.config.preview_toggle_key == 0 {
+                "none".to_string()
+            } else {
+                vk_to_label(self.config.preview_toggle_key)
+            };
+            self.draw_bind_button(ui, &CaptureTarget::PreviewToggleKey, label);
+            if self.config.preview_toggle_key != 0 && ui.button("Clear").clicked() {
+                self.config.preview_toggle_key = 0;
+                self.touch();
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Sticky toggle: previews stay hidden until you press the key again.",
+            )
+            .size(10.0)
+            .color(NICOTINE_BLACK),
+        );
+
+        ui.add_space(12.0);
         Self::draw_section_header(ui, "Keyboard Hotkeys");
 
         let prev_enable = self.config.enable_keyboard_buttons;
@@ -1025,50 +1072,6 @@ impl ConfigPanel {
                 let mut live = self.live.lock().unwrap();
                 live.smart_hide_enabled = self.config.smart_hide_enabled;
             }
-
-            ui.horizontal(|ui| {
-                ui.label("Show/Hide hotkey:");
-
-                let current_mod = self.config.preview_toggle_modifier;
-                let selected_label = MODIFIER_CHOICES
-                    .iter()
-                    .find(|(m, _)| *m == current_mod)
-                    .map(|(_, l)| *l)
-                    .unwrap_or("None");
-                let mut new_mod = current_mod;
-                egui::ComboBox::from_id_salt("preview_toggle_mod")
-                    .selected_text(selected_label)
-                    .width(70.0)
-                    .show_ui(ui, |ui| {
-                        for (code, label) in MODIFIER_CHOICES {
-                            if ui.selectable_label(new_mod == *code, *label).clicked() {
-                                new_mod = *code;
-                            }
-                        }
-                    });
-                if new_mod != current_mod {
-                    self.config.preview_toggle_modifier = new_mod;
-                    self.touch();
-                }
-
-                let label = if self.config.preview_toggle_key == 0 {
-                    "none".to_string()
-                } else {
-                    vk_to_label(self.config.preview_toggle_key)
-                };
-                self.draw_bind_button(ui, &CaptureTarget::PreviewToggleKey, label);
-                if self.config.preview_toggle_key != 0 && ui.button("Clear").clicked() {
-                    self.config.preview_toggle_key = 0;
-                    self.touch();
-                }
-            });
-            ui.label(
-                egui::RichText::new(
-                    "Sticky toggle: previews stay hidden until you press the key again.",
-                )
-                .size(10.0)
-                .color(NICOTINE_BLACK),
-            );
         });
     }
 }
