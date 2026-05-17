@@ -32,14 +32,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, IsHungAppWindow, KillTimer, LoadCursorW,
-    RegisterClassExW, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, EVENT_SYSTEM_FOREGROUND, GWLP_USERDATA, GWL_EXSTYLE, HCURSOR,
-    HICON, HMENU, HWND_TOPMOST, IDC_ARROW, LWA_ALPHA, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WINEVENT_OUTOFCONTEXT, WM_DESTROY, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, IsHungAppWindow, IsWindow, KillTimer,
+    LoadCursorW, RegisterClassExW, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TranslateMessage, EVENT_SYSTEM_FOREGROUND, GWLP_USERDATA,
+    GWL_EXSTYLE, HCURSOR, HICON, HMENU, HWND_TOPMOST, IDC_ARROW, LWA_ALPHA, MSG,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
+    WINEVENT_OUTOFCONTEXT, WM_DESTROY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
+    WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 
 /// `WM_MOUSELEAVE` isn't exported from `Win32::UI::WindowsAndMessaging`
@@ -523,9 +524,14 @@ impl PreviewManager {
                 set_window_interactive(preview.hwnd, target_interactive);
             }
         }
+        // Same treatment for the list window: SW_HIDE on a layered
+        // window leaks clicks, and even visible the list should honor
+        // previews_interactive (otherwise a click-through layout still
+        // catches mouse on the list panel).
         if let Some(list) = &self.list {
             unsafe {
                 let _ = ShowWindow(list.hwnd, cmd);
+                set_window_interactive(list.hwnd, target_interactive);
             }
         }
     }
@@ -542,6 +548,19 @@ impl PreviewManager {
             let s = self.state.lock().unwrap();
             s.get_windows().to_vec()
         };
+        // The daemon refreshes the window list every 500ms; in the gap
+        // between an EVE client closing and that refresh, `windows`
+        // still carries the dead HWND. A preview bound to a dead source
+        // keeps WS_VISIBLE + topmost but renders no thumbnail, and its
+        // wnd_proc still receives WM_LBUTTONDOWN — so the user sees an
+        // "empty" preview swallow clicks aimed at whatever now sits
+        // under it. Filter dead HWNDs before retain/spawn so we both
+        // drop the orphan and avoid binding a fresh DWM thumbnail to
+        // a dead source on this tick.
+        let windows: Vec<_> = windows
+            .into_iter()
+            .filter(|w| unsafe { IsWindow(Some(id_to_hwnd(w.id))).as_bool() })
+            .collect();
 
         // Drop previews whose source EVE client is no longer present.
         let live_names: std::collections::HashSet<String> =
@@ -675,9 +694,13 @@ impl PreviewManager {
             .filter(|(x, y)| position_on_screen(*x, *y))
             .unwrap_or((20, 20));
 
+        // WS_EX_LAYERED so apply_visibility can toggle WS_EX_TRANSPARENT
+        // for click-through into other-process windows beneath. Layered
+        // windows don't render until SetLayeredWindowAttributes is
+        // called at least once, so we set alpha=255 right after create.
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
                 PCWSTR(class_name.as_ptr()),
                 PCWSTR(title.as_ptr()),
                 WS_POPUP | WS_VISIBLE,
@@ -701,6 +724,7 @@ impl PreviewManager {
         });
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
             let _ = SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
@@ -710,6 +734,13 @@ impl PreviewManager {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
+            // Same gate as create_preview: a list window spawned during
+            // a hidden phase, or while previews_interactive is off,
+            // shouldn't catch clicks at its spawn rect before the next
+            // reconcile.
+            let want_interactive =
+                self.previews_should_be_visible() && self.live.lock().unwrap().previews_interactive;
+            set_window_interactive(hwnd, want_interactive);
         }
 
         self.list = Some(OwnedListWindow { hwnd });
