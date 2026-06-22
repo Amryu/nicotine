@@ -15,6 +15,25 @@ pub struct CharacterHotkey {
     pub modifier: Option<u16>,
 }
 
+/// A named cycle group: a subset of characters that cycle together. With
+/// groups enabled, forward/backward cycling traverses only the *current*
+/// group's running clients. An optional activation hotkey makes the group
+/// current; activating any client by its own hotkey also makes that
+/// client's group current. A group is only "active" when at least one of
+/// its members is running.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct CycleGroup {
+    pub name: String,
+    #[serde(default)]
+    pub members: Vec<String>,
+    /// Activation hotkey code (evdev on Linux / Win32 VK on Windows) and an
+    /// optional held modifier. None = unbound.
+    #[serde(default)]
+    pub vk: Option<u16>,
+    #[serde(default)]
+    pub modifier: Option<u16>,
+}
+
 /// How the visible-at-a-glance view of clients is rendered.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayMode {
@@ -157,6 +176,25 @@ pub struct Config {
     /// without reassigning keys.
     #[serde(default)]
     pub character_hotkeys: HashMap<String, CharacterHotkey>,
+    /// Whether cycle groups are active. Off (default) = one implicit group
+    /// of all characters — classic behavior.
+    #[serde(default)]
+    pub groups_enabled: bool,
+    /// Configured cycle groups (each a named subset of `characters`).
+    #[serde(default)]
+    pub groups: Vec<CycleGroup>,
+    /// Compact group rendering in the overlay.
+    #[serde(default)]
+    pub group_compact_overlay: bool,
+    /// Show only the current group's client previews. Forced on when group
+    /// preview windows are enabled.
+    #[serde(default)]
+    pub group_only_current_previews: bool,
+    /// Inactive-group panel size in px (snaps like previews).
+    #[serde(default = "default_group_panel_width")]
+    pub group_panel_width: u32,
+    #[serde(default = "default_group_panel_height")]
+    pub group_panel_height: u32,
     /// Config-panel window size in logical pixels. Persisted so a manual
     /// resize of the panel survives restarts; defaults to the original
     /// fixed window size.
@@ -241,6 +279,14 @@ fn default_mouse_device_path() -> Option<String> {
 
 fn default_minimize_inactive() -> bool {
     false
+}
+
+fn default_group_panel_width() -> u32 {
+    160
+}
+
+fn default_group_panel_height() -> u32 {
+    90
 }
 
 fn default_keyboard_device_path() -> Option<String> {
@@ -395,6 +441,12 @@ impl Config {
             display_mode: default_display_mode(),
             positions_locked: false,
             character_hotkeys: HashMap::new(),
+            groups_enabled: false,
+            groups: Vec::new(),
+            group_compact_overlay: false,
+            group_only_current_previews: false,
+            group_panel_width: default_group_panel_width(),
+            group_panel_height: default_group_panel_height(),
             window_width: default_window_width(),
             window_height: default_window_height(),
         }
@@ -449,6 +501,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cycle_group_round_trips_and_defaults_off() {
+        let g = CycleGroup {
+            name: "Logi".into(),
+            members: vec!["Alpha".into(), "Bravo".into()],
+            vk: Some(33),
+            modifier: Some(29),
+        };
+        let back: CycleGroup = toml::from_str(&toml::to_string(&g).unwrap()).unwrap();
+        assert_eq!(g, back);
+        // Groups are off by default and the list starts empty.
+        let c = Config::build_default(1920, 1080);
+        assert!(!c.groups_enabled);
+        assert!(c.groups.is_empty());
+    }
+
+    #[test]
     fn test_eve_height_adjusted_with_panel() {
         let config = Config {
             display_width: 1920,
@@ -481,6 +549,12 @@ mod tests {
             display_mode: DisplayMode::Previews,
             positions_locked: false,
             character_hotkeys: HashMap::new(),
+            groups_enabled: false,
+            groups: Vec::new(),
+            group_compact_overlay: false,
+            group_only_current_previews: false,
+            group_panel_width: 160,
+            group_panel_height: 90,
         };
 
         // Height should be: 1080 - 40 = 1040
@@ -520,6 +594,12 @@ mod tests {
             display_mode: DisplayMode::Previews,
             positions_locked: false,
             character_hotkeys: HashMap::new(),
+            groups_enabled: false,
+            groups: Vec::new(),
+            group_compact_overlay: false,
+            group_only_current_previews: false,
+            group_panel_width: 160,
+            group_panel_height: 90,
         };
 
         assert_eq!(config.eve_height_adjusted(), 1080);
@@ -558,6 +638,12 @@ mod tests {
             display_mode: DisplayMode::Previews,
             positions_locked: false,
             character_hotkeys: HashMap::new(),
+            groups_enabled: false,
+            groups: Vec::new(),
+            group_compact_overlay: false,
+            group_only_current_previews: false,
+            group_panel_width: 160,
+            group_panel_height: 90,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
