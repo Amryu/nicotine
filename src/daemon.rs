@@ -99,6 +99,11 @@ impl Daemon {
             .lock()
             .unwrap()
             .set_character_order(character_order.clone());
+        state.lock().unwrap().set_groups(if config.groups_enabled {
+            config.groups.clone()
+        } else {
+            Vec::new()
+        });
 
         #[cfg(unix)]
         let mouse_config = Arc::new(Mutex::new(MouseConfig::from_config(&config)));
@@ -201,6 +206,12 @@ impl Daemon {
                         .set_character_order(new_order.clone());
                     last_order = new_order;
                 }
+                // Cheap to refresh every tick; set_groups only swaps the vec.
+                state_clone.lock().unwrap().set_groups(if fresh_config.groups_enabled {
+                    fresh_config.groups.clone()
+                } else {
+                    Vec::new()
+                });
 
                 // Linux input listeners read live bindings from the
                 // shared MouseConfig/KeyboardConfig mutexes; the

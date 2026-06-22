@@ -1,5 +1,7 @@
+use crate::config::CycleGroup;
 use crate::window_manager::{EveWindow, WindowManager};
 use anyhow::Result;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// After Nicotine itself drives a focus change via `activate_window`, the
@@ -19,6 +21,17 @@ pub struct CycleState {
     /// listed names that aren't currently logged in. When None, cycles
     /// through windows in whatever order the window manager reports them.
     character_order: Option<Vec<String>>,
+    /// Configured cycle groups. Empty = groups disabled (classic behavior:
+    /// cycling traverses the whole `character_order`).
+    groups: Vec<CycleGroup>,
+    /// The group cycling is currently scoped to (index into `groups`). Set
+    /// when a client or group is activated; `None` falls back to the active
+    /// client's group.
+    current_group: Option<usize>,
+    /// Per-group last-active character name, so activating a group returns to
+    /// the client you were last on there. Also feeds the inactive-group
+    /// overlay panels.
+    group_last_active: HashMap<usize, String>,
     /// When we last drove an activation ourselves. Gates `sync_with_active`
     /// against the compositor's asynchronous focus commit — see
     /// `ACTIVATION_GRACE`.
@@ -31,12 +44,92 @@ impl CycleState {
             current_index: 0,
             windows: Vec::new(),
             character_order: None,
+            groups: Vec::new(),
+            current_group: None,
+            group_last_active: HashMap::new(),
             last_activated: None,
         }
     }
 
     pub fn set_character_order(&mut self, order: Option<Vec<String>>) {
         self.character_order = order;
+    }
+
+    /// Install the configured cycle groups (empty disables grouping). Clears a
+    /// now-out-of-range current group selection.
+    pub fn set_groups(&mut self, groups: Vec<CycleGroup>) {
+        self.groups = groups;
+        if self.current_group.is_some_and(|g| g >= self.groups.len()) {
+            self.current_group = None;
+        }
+    }
+
+    /// The group cycling is currently scoped to, if any.
+    #[cfg_attr(unix, allow(dead_code))]
+    pub fn current_group(&self) -> Option<usize> {
+        self.current_group
+    }
+
+    /// Members of the group cycling is currently scoped to, or None when
+    /// groups are disabled or no group applies (cycle everything). Falls back
+    /// to the active client's group when nothing is explicitly selected.
+    fn current_group_members(&self) -> Option<&[String]> {
+        if self.groups.is_empty() {
+            return None;
+        }
+        let gi = self
+            .current_group
+            .or_else(|| self.group_of_window(self.current_index))?;
+        self.groups.get(gi).map(|g| g.members.as_slice())
+    }
+
+    /// Index of the group containing the character shown in window `idx`.
+    fn group_of_window(&self, idx: usize) -> Option<usize> {
+        let title = &self.windows.get(idx)?.title;
+        self.groups
+            .iter()
+            .position(|g| g.members.iter().any(|m| m == title))
+    }
+
+    /// Record the active client's group as current and as that group's
+    /// last-active client. No-op when groups are disabled.
+    fn note_active(&mut self) {
+        if self.groups.is_empty() {
+            return;
+        }
+        if let Some(gi) = self.group_of_window(self.current_index) {
+            self.current_group = Some(gi);
+            if let Some(w) = self.windows.get(self.current_index) {
+                self.group_last_active.insert(gi, w.title.clone());
+            }
+        }
+    }
+
+    /// Make group `idx` current and switch to its last-active running client
+    /// (or its first running member). No-op if the group has no running
+    /// member — an inactive group can't be activated.
+    #[cfg_attr(unix, allow(dead_code))]
+    pub fn activate_group(
+        &mut self,
+        idx: usize,
+        wm: &dyn WindowManager,
+        minimize_inactive: bool,
+    ) -> Result<()> {
+        let Some(group) = self.groups.get(idx) else {
+            return Ok(());
+        };
+        let running = |name: &String| self.windows.iter().any(|w| &w.title == name);
+        let target = self
+            .group_last_active
+            .get(&idx)
+            .filter(|n| running(n))
+            .cloned()
+            .or_else(|| group.members.iter().find(|m| running(m)).cloned());
+        let Some(name) = target else {
+            return Ok(());
+        };
+        self.current_group = Some(idx);
+        self.switch_to_character(&name, wm, minimize_inactive)
     }
 
     /// Live view of the configured cycle order. The Daemon used to
@@ -55,13 +148,18 @@ impl CycleState {
     /// who are currently logged in are included, in list order. Otherwise
     /// every window is included in detection order.
     fn cycle_indices(&self) -> Vec<usize> {
+        let members = self.current_group_members();
+        let in_group = |title: &str| members.is_none_or(|m| m.iter().any(|x| x == title));
         if let Some(order) = &self.character_order {
             order
                 .iter()
+                .filter(|name| in_group(name))
                 .filter_map(|name| self.windows.iter().position(|w| &w.title == name))
                 .collect()
         } else {
-            (0..self.windows.len()).collect()
+            (0..self.windows.len())
+                .filter(|&i| in_group(&self.windows[i].title))
+                .collect()
         }
     }
 
@@ -120,6 +218,7 @@ impl CycleState {
             let id = self.windows[target_idx].id;
             wm.activate_window(id)?;
             self.last_activated = Some(Instant::now());
+            self.note_active();
             return Ok(());
         }
 
@@ -136,6 +235,7 @@ impl CycleState {
             let prev_id = self.windows[previous_index].id;
             let _ = wm.minimize_window(prev_id);
         }
+        self.note_active();
         Ok(())
     }
 
@@ -206,6 +306,7 @@ impl CycleState {
             let _ = wm.minimize_window(previous_window_id);
         }
 
+        self.note_active();
         Ok(())
     }
 
@@ -339,6 +440,7 @@ impl CycleState {
             let _ = wm.minimize_window(previous_window_id);
         }
 
+        self.note_active();
         Ok(())
     }
 }
@@ -882,5 +984,108 @@ mod tests {
         // back into range rather than pointing past the end.
         state.update_windows(vec![create_test_window(1, "A"), create_test_window(2, "B")]);
         assert_eq!(state.get_current_index(), 0);
+    }
+
+    fn group(name: &str, members: &[&str]) -> CycleGroup {
+        CycleGroup {
+            name: name.to_string(),
+            members: members.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn title_at(state: &CycleState) -> String {
+        state.get_windows()[state.get_current_index()].title.clone()
+    }
+
+    fn grouped_state() -> CycleState {
+        let mut state = CycleState::new();
+        state.update_windows(vec![
+            create_test_window(1, "A"),
+            create_test_window(2, "B"),
+            create_test_window(3, "C"),
+            create_test_window(4, "D"),
+        ]);
+        state.set_character_order(Some(
+            ["A", "B", "C", "D"].iter().map(|s| s.to_string()).collect(),
+        ));
+        state.set_groups(vec![group("G1", &["A", "B"]), group("G2", &["C", "D"])]);
+        state
+    }
+
+    #[test]
+    fn group_scoped_cycling_stays_within_current_group() {
+        let mut state = grouped_state();
+        let wm = MockWindowManager::new();
+        state.switch_to_character("A", &wm, false).unwrap();
+        assert_eq!(state.current_group(), Some(0));
+        state.cycle_forward(&wm, false).unwrap();
+        assert_eq!(title_at(&state), "B");
+        // Wraps within G1 (A,B) — must NOT cross into C.
+        state.cycle_forward(&wm, false).unwrap();
+        assert_eq!(title_at(&state), "A");
+        state.cycle_backward(&wm, false).unwrap();
+        assert_eq!(title_at(&state), "B");
+    }
+
+    #[test]
+    fn activate_group_switches_and_rescopes() {
+        let mut state = grouped_state();
+        let wm = MockWindowManager::new();
+        state.switch_to_character("A", &wm, false).unwrap();
+        state.activate_group(1, &wm, false).unwrap();
+        assert_eq!(state.current_group(), Some(1));
+        assert_eq!(title_at(&state), "C"); // first running member of G2
+        state.cycle_forward(&wm, false).unwrap();
+        assert_eq!(title_at(&state), "D");
+        state.cycle_forward(&wm, false).unwrap();
+        assert_eq!(title_at(&state), "C"); // wraps within G2
+    }
+
+    #[test]
+    fn activate_group_is_noop_when_no_member_running() {
+        let mut state = CycleState::new();
+        state.update_windows(vec![create_test_window(1, "A"), create_test_window(2, "B")]);
+        state.set_character_order(Some(vec!["A".to_string(), "B".to_string()]));
+        state.set_groups(vec![group("G1", &["A", "B"]), group("G2", &["C", "D"])]);
+        let wm = MockWindowManager::new();
+        state.switch_to_character("A", &wm, false).unwrap();
+        // G2 has no running members → activation does nothing.
+        state.activate_group(1, &wm, false).unwrap();
+        assert_eq!(state.current_group(), Some(0));
+        assert_eq!(title_at(&state), "A");
+    }
+
+    #[test]
+    fn group_last_active_is_remembered_across_groups() {
+        let mut state = grouped_state();
+        let wm = MockWindowManager::new();
+        state.switch_to_character("A", &wm, false).unwrap();
+        state.cycle_forward(&wm, false).unwrap(); // G1 last-active = B
+        assert_eq!(title_at(&state), "B");
+        state.switch_to_character("C", &wm, false).unwrap(); // jump to G2
+        assert_eq!(state.current_group(), Some(1));
+        state.activate_group(0, &wm, false).unwrap(); // back to G1
+        assert_eq!(title_at(&state), "B"); // remembered, not A
+    }
+
+    #[test]
+    fn groups_disabled_cycles_everything() {
+        let mut state = CycleState::new();
+        state.update_windows(vec![
+            create_test_window(1, "A"),
+            create_test_window(2, "B"),
+            create_test_window(3, "C"),
+        ]);
+        state.set_character_order(Some(
+            ["A", "B", "C"].iter().map(|s| s.to_string()).collect(),
+        ));
+        // No set_groups → classic full-list cycling.
+        let wm = MockWindowManager::new();
+        state.switch_to_character("A", &wm, false).unwrap();
+        state.cycle_forward(&wm, false).unwrap();
+        assert_eq!(title_at(&state), "B");
+        state.cycle_forward(&wm, false).unwrap();
+        assert_eq!(title_at(&state), "C");
     }
 }
