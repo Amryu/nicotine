@@ -541,9 +541,23 @@ impl PreviewManager {
     /// so re-running this hides the newly-active preview and remaps the
     /// one cycled away from.
     fn apply_active_visibility(&mut self) {
-        let hide_active = self.live.lock_recover().hide_active_preview;
-        for preview in self.previews.values_mut() {
-            let want_hidden = preview_should_hide(hide_active, preview.is_active);
+        let (hide_active, group_only) = {
+            let live = self.live.lock_recover();
+            (live.hide_active_preview, live.group_only_current_previews)
+        };
+        // When "show only current group" is on, hide previews whose character
+        // isn't in the current group. None = no group filter (groups off).
+        let group_titles = if group_only {
+            self.state.lock_recover().current_group_titles()
+        } else {
+            None
+        };
+        for (name, preview) in self.previews.iter_mut() {
+            let out_of_group = group_titles
+                .as_ref()
+                .is_some_and(|titles| !titles.contains(name));
+            let want_hidden =
+                preview_should_hide(hide_active, preview.is_active) || out_of_group;
             if want_hidden == preview.hidden {
                 continue;
             }

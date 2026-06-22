@@ -527,6 +527,7 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
         }
         Message::GroupOnlyPreviewsToggled(v) => {
             panel.config.group_only_current_previews = v;
+            panel.live.lock().unwrap().group_only_current_previews = v;
             panel.touch();
         }
         Message::GroupPanelWidthChanged(w) => {

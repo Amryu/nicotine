@@ -73,6 +73,9 @@ pub struct LiveSettings {
     /// away from reappears. Read live so the toggle takes effect without
     /// a restart.
     pub hide_active_preview: bool,
+    /// Mirror of `config.group_only_current_previews`: when true (and groups
+    /// are enabled), only the current group's client previews are shown.
+    pub group_only_current_previews: bool,
 }
 
 impl LiveSettings {
@@ -85,6 +88,7 @@ impl LiveSettings {
             positions_locked: config.positions_locked,
             show_previews: config.show_previews,
             hide_active_preview: config.hide_active_preview,
+            group_only_current_previews: config.group_only_current_previews,
         }))
     }
 }

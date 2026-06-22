@@ -70,6 +70,13 @@ impl CycleState {
         self.current_group
     }
 
+    /// Member titles of the group cycling is currently scoped to (None when
+    /// groups are disabled or no group applies). Used by the preview managers
+    /// to show only the current group's previews.
+    pub fn current_group_titles(&self) -> Option<Vec<String>> {
+        self.current_group_members().map(|m| m.to_vec())
+    }
+
     /// Members of the group cycling is currently scoped to, or None when
     /// groups are disabled or no group applies (cycle everything). Falls back
     /// to the active client's group when nothing is explicitly selected.
