@@ -3,7 +3,7 @@
 //! same shape, same hot-reload contract, plus the character_hotkeys
 //! dispatch path that was missing from Linux entirely until now.
 
-use crate::config::{CharacterHotkey, Config, LiveSettings};
+use crate::config::{CharacterHotkey, Config, CycleGroup, LiveSettings};
 use crate::cycle_state::CycleState;
 use crate::window_manager::WindowManager;
 use anyhow::Result;
@@ -26,6 +26,8 @@ pub struct KeyboardConfig {
     pub character_hotkeys: HashMap<String, CharacterHotkey>,
     pub toggle_previews_key: Option<u16>,
     pub toggle_previews_modifier: Option<u16>,
+    /// Cycle groups with activation hotkeys (empty when groups are disabled).
+    pub groups: Vec<CycleGroup>,
 }
 
 impl KeyboardConfig {
@@ -40,6 +42,11 @@ impl KeyboardConfig {
             character_hotkeys: c.character_hotkeys.clone(),
             toggle_previews_key: c.toggle_previews_key,
             toggle_previews_modifier: c.toggle_previews_modifier,
+            groups: if c.groups_enabled {
+                c.groups.clone()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -48,7 +55,10 @@ impl KeyboardConfig {
     /// off AND no character hotkeys AND no preview-toggle key are bound —
     /// otherwise a press it cares about would be missed.
     fn has_work(&self) -> bool {
-        self.enable || !self.character_hotkeys.is_empty() || self.toggle_previews_key.is_some()
+        self.enable
+            || !self.character_hotkeys.is_empty()
+            || self.toggle_previews_key.is_some()
+            || self.groups.iter().any(|g| g.vk.is_some())
     }
 }
 
@@ -151,6 +161,7 @@ impl KeyboardListener {
                 .chain(snap.modifier_key)
                 .chain(snap.toggle_previews_modifier)
                 .chain(snap.character_hotkeys.values().filter_map(|hk| hk.modifier))
+                .chain(snap.groups.iter().filter_map(|g| g.modifier))
                 .collect();
             // Forget pressed modifiers that are no longer modifiers in
             // any binding — otherwise a key the user un-bound stays
@@ -265,6 +276,19 @@ impl KeyboardListener {
                         }
                         continue;
                     }
+                }
+
+                // Group activation hotkey? Switches to (and rescopes cycling
+                // onto) the group's last-active / first-running client.
+                if let Some(gi) = resolve_group_hotkey(code, &pressed_modifiers, &snap.groups) {
+                    let mut st = state.lock().unwrap();
+                    if let Ok(active) = wm.get_active_window() {
+                        st.sync_with_active(active);
+                    }
+                    if let Err(e) = st.activate_group(gi, &*wm, snap.minimize_inactive) {
+                        eprintln!("Failed to activate group: {}", e);
+                    }
+                    continue;
                 }
 
                 let target =
@@ -430,6 +454,24 @@ fn resolve_character_hotkey(
         .map(|(name, _)| name.clone())
 }
 
+/// Pick the group (index) whose activation hotkey matches a key press.
+/// Modifier-bearing bindings whose modifier is held win over bare-key ones,
+/// matching `resolve_character_hotkey`.
+fn resolve_group_hotkey(
+    code: u16,
+    pressed_modifiers: &HashSet<u16>,
+    groups: &[CycleGroup],
+) -> Option<usize> {
+    if let Some(i) = groups.iter().position(|g| {
+        g.vk == Some(code) && g.modifier.is_some_and(|m| pressed_modifiers.contains(&m))
+    }) {
+        return Some(i);
+    }
+    groups
+        .iter()
+        .position(|g| g.vk == Some(code) && g.modifier.is_none())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,6 +609,7 @@ mod tests {
             character_hotkeys: HashMap::new(),
             toggle_previews_key: None,
             toggle_previews_modifier: None,
+            groups: Vec::new(),
         }
     }
 

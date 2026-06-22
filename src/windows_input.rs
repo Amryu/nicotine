@@ -30,6 +30,8 @@ const HOTKEY_TOGGLE_PREVIEWS_ID: i32 = 1003;
 /// character, in the order the config lists them. Separated from the
 /// cycle IDs so the message dispatch can tell them apart by ID range.
 const HOTKEY_CHARACTER_BASE: i32 = 2000;
+/// Group activation hotkey IDs start here; one per configured group, in order.
+const HOTKEY_GROUP_BASE: i32 = 3000;
 
 /// Lookup from per-character hotkey ID → the character name to
 /// activate on WM_HOTKEY. Rebuilt from scratch each time hotkeys are
@@ -38,6 +40,13 @@ static CHARACTER_HOTKEY_LOOKUP: OnceLock<Mutex<HashMap<i32, String>>> = OnceLock
 
 fn character_lookup() -> &'static Mutex<HashMap<i32, String>> {
     CHARACTER_HOTKEY_LOOKUP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Registered group hotkey IDs, tracked so they can be unregistered on rebind.
+static GROUP_HOTKEY_IDS: OnceLock<Mutex<Vec<i32>>> = OnceLock::new();
+
+fn group_hotkey_ids() -> &'static Mutex<Vec<i32>> {
+    GROUP_HOTKEY_IDS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 const WM_USER_FORWARD: u32 = WM_USER + 1;
@@ -319,7 +328,7 @@ fn run_listener(
         // Per-character jump hotkey?
         if msg.message == WM_HOTKEY {
             let id = msg.wParam.0 as i32;
-            if id >= HOTKEY_CHARACTER_BASE {
+            if (HOTKEY_CHARACTER_BASE..HOTKEY_GROUP_BASE).contains(&id) {
                 let name = character_lookup().lock().unwrap().get(&id).cloned();
                 if let Some(name) = name {
                     let minimize_inactive = minimize_inactive_lookup();
@@ -331,6 +340,16 @@ fn run_listener(
                     {
                         eprintln!("Character switch failed: {}", e);
                     }
+                }
+            } else if id >= HOTKEY_GROUP_BASE {
+                let gi = (id - HOTKEY_GROUP_BASE) as usize;
+                let minimize_inactive = minimize_inactive_lookup();
+                let mut state_guard = state.lock().unwrap();
+                if let Ok(active) = wm.get_active_window() {
+                    state_guard.sync_with_active(active);
+                }
+                if let Err(e) = state_guard.activate_group(gi, &*wm, minimize_inactive) {
+                    eprintln!("Group activation failed: {}", e);
                 }
             }
         }
@@ -395,6 +414,23 @@ unsafe fn do_register_hotkeys(config: &Config) {
             );
         }
     }
+
+    // Group activation hotkeys (id = HOTKEY_GROUP_BASE + group index).
+    let mut group_ids = group_hotkey_ids().lock().unwrap();
+    group_ids.clear();
+    if config.groups_enabled {
+        for (i, group) in config.groups.iter().enumerate() {
+            if let Some(vk) = group.vk {
+                let id = HOTKEY_GROUP_BASE + i as i32;
+                let modifier = modifier_to_winapi(group.modifier.and_then(modifier_kind));
+                if RegisterHotKey(None, id, modifier, vk as u32).is_ok() {
+                    group_ids.push(id);
+                } else {
+                    eprintln!("Failed to register group hotkey for '{}'", group.name);
+                }
+            }
+        }
+    }
 }
 
 fn register_hotkeys(config: &Config) {
@@ -411,6 +447,10 @@ fn unregister_hotkeys() {
             let _ = UnregisterHotKey(None, *id);
         }
         lookup.clear();
+        let mut group_ids = group_hotkey_ids().lock().unwrap();
+        for id in group_ids.drain(..) {
+            let _ = UnregisterHotKey(None, id);
+        }
     }
 }
 
