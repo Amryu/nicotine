@@ -1,4 +1,4 @@
-use crate::config::{CharacterHotkey, Config, LiveSettings};
+use crate::config::{CharacterHotkey, Config, CycleGroup, LiveSettings};
 use iced::{Color, Element, Subscription, Task, Theme};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -61,6 +61,7 @@ pub(super) enum CaptureTarget {
     ModifierKey,
     TogglePreviews,
     Character(String),
+    Group(usize),
 }
 
 /// Which settings tab is shown in the left nav rail.
@@ -68,6 +69,7 @@ pub(super) enum CaptureTarget {
 pub(super) enum Tab {
     Display,
     Characters,
+    Groups,
     Hotkeys,
 }
 
@@ -229,6 +231,8 @@ pub(super) struct Panel {
     pub audio: std::sync::mpsc::Sender<()>,
     /// Buffer for the "add character" text input.
     pub new_character_buffer: String,
+    /// Buffer for the "new group" name input.
+    pub new_group_buffer: String,
     /// When `Some(..)`, the next keypress binds to this field.
     pub capturing: Option<CaptureTarget>,
     /// Timestamp of the last edit; the debounce subscription flushes to
@@ -298,6 +302,7 @@ impl Panel {
             aspect_ratio,
             restack_supported,
             new_character_buffer: String::new(),
+            new_group_buffer: String::new(),
             capturing: None,
             last_change: None,
             active_tab: Tab::Display,
@@ -357,6 +362,11 @@ impl Panel {
                         .character_hotkeys
                         .insert(name.clone(), CharacterHotkey { vk, modifier });
                 }
+                CaptureTarget::Group(i) => {
+                    if let Some(g) = self.config.groups.get_mut(*i) {
+                        g.vk = Some(vk);
+                    }
+                }
             }
             self.capturing = None;
             self.touch();
@@ -394,6 +404,19 @@ pub(super) enum Message {
     AddCharacter,
     CharacterModifierChanged(String, ModifierChoice),
     ClearCharacterHotkey(String),
+    GroupsEnabledToggled(bool),
+    GroupCompactToggled(bool),
+    GroupOnlyPreviewsToggled(bool),
+    GroupPanelWidthChanged(u32),
+    GroupPanelHeightChanged(u32),
+    AddGroup,
+    RemoveGroup(usize),
+    GroupNameChanged(usize, String),
+    NewGroupChanged(String),
+    AddGroupMember(usize, String),
+    RemoveGroupMember(usize, String),
+    GroupModifierChanged(usize, ModifierChoice),
+    ClearGroupHotkey(usize),
     KeyboardEnabledToggled(bool),
     MouseEnabledToggled(bool),
     ClearModifier,
@@ -493,6 +516,82 @@ fn update(panel: &mut Panel, message: Message) -> Task<Message> {
         Message::ClearCharacterHotkey(name) => {
             panel.config.character_hotkeys.remove(&name);
             panel.touch();
+        }
+        Message::GroupsEnabledToggled(v) => {
+            panel.config.groups_enabled = v;
+            panel.touch();
+        }
+        Message::GroupCompactToggled(v) => {
+            panel.config.group_compact_overlay = v;
+            panel.touch();
+        }
+        Message::GroupOnlyPreviewsToggled(v) => {
+            panel.config.group_only_current_previews = v;
+            panel.touch();
+        }
+        Message::GroupPanelWidthChanged(w) => {
+            panel.config.group_panel_width = w;
+            panel.touch();
+        }
+        Message::GroupPanelHeightChanged(h) => {
+            panel.config.group_panel_height = h;
+            panel.touch();
+        }
+        Message::AddGroup => {
+            let typed = panel.new_group_buffer.trim().to_string();
+            let name = if typed.is_empty() {
+                format!("Group {}", panel.config.groups.len() + 1)
+            } else {
+                typed
+            };
+            panel.config.groups.push(CycleGroup {
+                name,
+                ..Default::default()
+            });
+            panel.new_group_buffer.clear();
+            panel.touch();
+        }
+        Message::RemoveGroup(i) => {
+            if i < panel.config.groups.len() {
+                panel.config.groups.remove(i);
+                panel.touch();
+            }
+        }
+        Message::GroupNameChanged(i, s) => {
+            if let Some(g) = panel.config.groups.get_mut(i) {
+                g.name = s;
+                panel.touch();
+            }
+        }
+        Message::NewGroupChanged(s) => {
+            panel.new_group_buffer = s;
+        }
+        Message::AddGroupMember(i, name) => {
+            if let Some(g) = panel.config.groups.get_mut(i) {
+                if !g.members.contains(&name) {
+                    g.members.push(name);
+                }
+                panel.touch();
+            }
+        }
+        Message::RemoveGroupMember(i, name) => {
+            if let Some(g) = panel.config.groups.get_mut(i) {
+                g.members.retain(|m| m != &name);
+                panel.touch();
+            }
+        }
+        Message::GroupModifierChanged(i, choice) => {
+            if let Some(g) = panel.config.groups.get_mut(i) {
+                g.modifier = choice.code;
+                panel.touch();
+            }
+        }
+        Message::ClearGroupHotkey(i) => {
+            if let Some(g) = panel.config.groups.get_mut(i) {
+                g.vk = None;
+                g.modifier = None;
+                panel.touch();
+            }
         }
         Message::KeyboardEnabledToggled(v) => {
             panel.config.enable_keyboard_buttons = v;

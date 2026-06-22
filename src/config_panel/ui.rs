@@ -101,6 +101,7 @@ pub(super) fn tab_sidebar(panel: &Panel) -> Element<'_, Message> {
             Tab::Characters,
             panel.active_tab == Tab::Characters
         ),
+        tab_button("Groups", Tab::Groups, panel.active_tab == Tab::Groups),
         tab_button("Hotkeys", Tab::Hotkeys, panel.active_tab == Tab::Hotkeys),
     ]
     .spacing(4);
@@ -149,6 +150,7 @@ pub(super) fn tab_content(panel: &Panel) -> Element<'_, Message> {
             .spacing(20)
             .into(),
         Tab::Characters => characters_section(panel),
+        Tab::Groups => groups_section(panel),
         Tab::Hotkeys => hotkeys_section(panel),
     };
     container(inner)
@@ -349,6 +351,122 @@ fn characters_section(panel: &Panel) -> Element<'_, Message> {
                 .on_submit(Message::AddCharacter)
                 .width(Length::Fill),
             button(text("+")).on_press(Message::AddCharacter),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    );
+
+    col.into()
+}
+
+fn groups_section(panel: &Panel) -> Element<'_, Message> {
+    let mut col = column![
+        section_header("Cycle Groups"),
+        caption(
+            "Groups cycle a subset of clients together. A group's hotkey jumps to it and \
+             cycling then stays within it; activating any client also selects its group. A \
+             group is active only while at least one of its members is running."
+        ),
+        checkbox(panel.config.groups_enabled)
+            .label("Enable cycle groups")
+            .on_toggle(Message::GroupsEnabledToggled),
+    ]
+    .spacing(8);
+
+    if !panel.config.groups_enabled {
+        return col.into();
+    }
+
+    col = col.push(
+        checkbox(panel.config.group_compact_overlay)
+            .label("Compact group display in the overlay")
+            .on_toggle(Message::GroupCompactToggled),
+    );
+    col = col.push(
+        checkbox(panel.config.group_only_current_previews)
+            .label("Show only the current group's previews")
+            .on_toggle(Message::GroupOnlyPreviewsToggled),
+    );
+    col = col.push(
+        row![
+            text("Inactive-group panel:"),
+            text(format!(
+                "{}x{}px",
+                panel.config.group_panel_width, panel.config.group_panel_height
+            )),
+            slider(80..=480, panel.config.group_panel_width, Message::GroupPanelWidthChanged)
+                .width(Length::Fixed(110.0)),
+            slider(45..=360, panel.config.group_panel_height, Message::GroupPanelHeightChanged)
+                .width(Length::Fixed(110.0)),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    );
+
+    for (i, group) in panel.config.groups.iter().enumerate() {
+        let selected = MODIFIER_CHOICES
+            .iter()
+            .copied()
+            .find(|m| m.code == group.modifier);
+        let modifier_pick = pick_list(MODIFIER_CHOICES, selected, move |c| {
+            Message::GroupModifierChanged(i, c)
+        })
+        .width(Length::Fixed(80.0));
+        let binding_label = group.vk.map(code_to_label).unwrap_or_else(|| "none".into());
+
+        let mut header = row![
+            text_input("group name", &group.name)
+                .on_input(move |s| Message::GroupNameChanged(i, s))
+                .width(Length::Fill),
+            text("Hotkey:"),
+            modifier_pick,
+            bind_button(panel, CaptureTarget::Group(i), binding_label, 110.0),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        if group.vk.is_some() {
+            header = header.push(button(text("clear")).on_press(Message::ClearGroupHotkey(i)));
+        }
+        header = header.push(button(text("Delete")).on_press(Message::RemoveGroup(i)));
+
+        let mut members = row![text("Members:")].spacing(6).align_y(Alignment::Center);
+        for m in &group.members {
+            let mc = m.clone();
+            members = members.push(
+                button(text(format!("{} x", m))).on_press(Message::RemoveGroupMember(i, mc)),
+            );
+        }
+        let unassigned: Vec<String> = panel
+            .config
+            .characters
+            .iter()
+            .filter(|c| !group.members.contains(c))
+            .cloned()
+            .collect();
+        if !unassigned.is_empty() {
+            members = members.push(text("Add:")).push(
+                pick_list(unassigned, None::<String>, move |c| {
+                    Message::AddGroupMember(i, c)
+                })
+                .width(Length::Fixed(150.0)),
+            );
+        }
+
+        col = col.push(
+            container(column![header, members].spacing(4))
+                .padding(8)
+                .style(|_| filled(NICOTINE_CREAM)),
+        );
+    }
+
+    col = col.push(
+        row![
+            text("New group:"),
+            text_input("group name (optional)", &panel.new_group_buffer)
+                .on_input(Message::NewGroupChanged)
+                .on_submit(Message::AddGroup)
+                .width(Length::Fill),
+            button(text("+")).on_press(Message::AddGroup),
         ]
         .spacing(6)
         .align_y(Alignment::Center),
